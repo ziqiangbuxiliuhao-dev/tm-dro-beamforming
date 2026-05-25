@@ -1,0 +1,4405 @@
+import cvxpy as cp
+
+import argparse
+import math
+import os
+import random
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+from matplotlib.ticker import AutoMinorLocator
+from matplotlib.lines import Line2D
+
+# =========================================================
+# Publication style (PRINT-READY, grid & fonts visible)
+# =========================================================
+def set_pub_style():
+    """
+    Print-ready style:
+      - Times-like font
+      - strong but non-intrusive grid (major/minor)
+      - ticks/spines visible after downscaling
+      - PDF embeds TrueType fonts (fonttype 42)
+    """
+    mpl.rcParams.update({
+        # ---- Fonts ----
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "Times", "Nimbus Roman", "DejaVu Serif"],
+        "mathtext.fontset": "stix",
+        "axes.unicode_minus": False,
+
+        # ---- Save settings ----
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.02,
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+
+        # ---- Sizes (paper-like) ----
+        "axes.labelsize": 10,
+        "axes.titlesize": 10,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "legend.fontsize": 8,
+
+        # ---- Lines ----
+        "lines.linewidth": 2.0,
+        "lines.markersize": 5.2,
+
+        # ---- Axes ----
+        "axes.linewidth": 1.0,
+        "axes.grid": False,  # we control grid per-axis for major/minor
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+
+        # ---- Ticks ----
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "xtick.major.size": 4.0,
+        "ytick.major.size": 4.0,
+        "xtick.major.width": 1.0,
+        "ytick.major.width": 1.0,
+        "xtick.minor.size": 2.5,
+        "ytick.minor.size": 2.5,
+        "xtick.minor.width": 0.9,
+        "ytick.minor.width": 0.9,
+    })
+
+
+def apply_axis_style(ax: plt.Axes):
+    """
+    Ensure grid and tick appearance are 'journal visible' after downscale/print.
+    """
+    # Minor ticks
+    ax.xaxis.set_minor_locator(AutoMinorLocator(2))
+    ax.yaxis.set_minor_locator(AutoMinorLocator(2))
+
+    # Major grid (visible, not too dark)
+    ax.grid(True, which="major", linestyle="-", linewidth=0.8, alpha=0.35)
+
+    # Minor grid (lighter)
+    ax.grid(True, which="minor", linestyle="--", linewidth=0.6, alpha=0.22)
+
+    # Spines a bit stronger
+    for side in ["left", "bottom"]:
+        ax.spines[side].set_linewidth(1.0)
+
+    # Keep ticks crisp
+    ax.tick_params(which="both", top=False, right=False)
+
+
+def savefig_dual(path_base: str, dpi: int = 450):
+    """
+    Save both PDF (vector) and PNG (high-dpi raster preview).
+    """
+    plt.savefig(path_base + ".pdf")
+    plt.savefig(path_base + ".png", dpi=dpi)
+
+
+def legend_outside_bottom(ax: plt.Axes, max_cols: int = 4, y_offset: float = -0.26):
+    """
+    Put legend outside at bottom with clear frame.
+    """
+    handles, labels = ax.get_legend_handles_labels()
+    n_items = len(labels)
+    if n_items <= 6:
+        ncol = 2
+    elif n_items <= 9:
+        ncol = 3
+    else:
+        ncol = max_cols
+
+    leg = ax.legend(
+        handles, labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, y_offset),
+        ncol=ncol,
+        frameon=True,
+        fancybox=False,   # journal-like
+        borderaxespad=0.0,
+        columnspacing=1.1,
+        handlelength=2.0,
+        handletextpad=0.6,
+    )
+    leg.get_frame().set_linewidth(0.8)
+    leg.get_frame().set_alpha(0.95)
+
+    # Make room for legend
+    plt.subplots_adjust(bottom=0.32)
+
+
+# =========================================================
+# CSV / TeX table IO
+# =========================================================
+def write_csv(path: str, header: List[str], rows: List[List]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(",".join(header) + "\n")
+        for r in rows:
+            f.write(",".join([str(x) for x in r]) + "\n")
+
+
+def write_tex_table(path: str, caption: str, label: str,
+                    colspec: str, header_lines: list, body_lines: list,
+                    notes: str = None, footnotesize: bool = True):
+    import os
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    # Convert common Unicode symbols to LaTeX-safe expressions
+    def latex_safe(s):
+        if s is None:
+            return ""
+        s = str(s)
+        s = s.replace("Δ", r"$\Delta$")
+        s = s.replace("λ", r"$\lambda$")
+        s = s.replace("ρ", r"$\rho$")
+        s = s.replace("τ", r"$\tau$")
+        s = s.replace("Λ", r"$\boldsymbol{\Lambda}$")
+        return s
+
+    header_lines = [latex_safe(x) for x in header_lines]
+    body_lines = [latex_safe(x) for x in body_lines]
+    notes = latex_safe(notes)
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("% Auto-generated table\n")
+        f.write("\\begin{table*}[t]\n")
+        f.write("\\centering\n")
+        f.write(f"\\caption{{{caption}}}\n")
+        f.write(f"\\label{{{label}}}\n")
+        if footnotesize:
+            f.write("\\footnotesize\n")
+
+        f.write("\\setlength{\\tabcolsep}{4pt}\n")
+        f.write("\\renewcommand{\\arraystretch}{0.92}\n")
+
+        f.write("\\begin{tabular}{" + colspec + "}\n")
+        f.write("\\toprule\n")
+        for hl in header_lines:
+            f.write(hl + "\n")
+        f.write("\\midrule\n")
+        for bl in body_lines:
+            f.write(bl + "\n")
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+
+        if notes is not None and len(notes.strip()) > 0:
+            f.write("\\par\\vspace{0.35em}\n")
+            f.write("\\begin{minipage}{0.96\\textwidth}\n")
+            f.write("\\scriptsize ")
+            f.write(notes)
+            f.write("\n\\end{minipage}\n")
+
+        f.write("\\end{table*}\n")
+
+
+# =========================================================
+# Repro
+# =========================================================
+def set_seed(seed: int = 0):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# =========================================================
+# Complex helpers
+# =========================================================
+def cplx_eye(n: int, device, dtype=torch.complex64):
+    return torch.eye(n, device=device, dtype=dtype)
+
+
+def hermitize(R: torch.Tensor) -> torch.Tensor:
+    return 0.5 * (R + torch.conj(R.transpose(-1, -2)))
+
+
+def steering_ula(N: int, d_over_lambda: float, theta_deg: torch.Tensor, device, dtype=torch.complex64) -> torch.Tensor:
+    """
+    ULA steering: a_n = exp(j*2*pi*d/lambda*n*sin(theta)), normalized to ||a||2=1
+    theta_deg: [B]
+    return: [B, N]
+    """
+    theta = theta_deg * math.pi / 180.0
+    n = torch.arange(N, device=device, dtype=torch.float32)[None, :]
+    phase = 2.0 * math.pi * d_over_lambda * n * torch.sin(theta)[:, None]
+    a = torch.exp(1j * phase.to(torch.complex64))
+    a = a / torch.linalg.norm(a, dim=-1, keepdim=True).clamp_min(1e-12)
+    return a.to(dtype)
+
+
+def solve(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.linalg.solve(A, b.unsqueeze(-1)).squeeze(-1)
+
+
+def abs2(x: torch.Tensor) -> torch.Tensor:
+    return (x.real * x.real + x.imag * x.imag)
+
+
+def safe_log(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    return torch.log(x.clamp_min(eps))
+
+
+def trace_batch(R: torch.Tensor) -> torch.Tensor:
+    return R.diagonal(dim1=-2, dim2=-1).sum(-1)
+
+
+def quad_form(w: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
+    v = (torch.conj(w).unsqueeze(1) @ (R @ w.unsqueeze(-1))).squeeze(-1).squeeze(-1)
+    return v.real
+
+
+def display_offset_db(N: int) -> float:
+    return float(10.0 * np.log10(max(1, N)))
+
+
+# =========================================================
+# Simulation config
+# =========================================================
+@dataclass
+class SimCfg:
+    N: int = 10
+    d_over_lambda: float = 0.5
+    theta_s_nom_deg: float = -5.0
+    mismatch_std_deg: float = 2.0
+    theta_js_deg: Tuple[float, float, float] = (20.0, 50.0, 65.0)
+    INR_dB: float = 20.0
+    noise_var: float = 1.0
+    a_samples_M: int = 16
+
+
+def sample_complex_gaussian(shape, device, dtype=torch.complex64):
+    x = torch.randn(*shape, device=device, dtype=torch.float32)
+    y = torch.randn(*shape, device=device, dtype=torch.float32)
+    z = (x + 1j * y) / math.sqrt(2.0)
+    return z.to(dtype)
+
+
+def gen_scene_batch(cfg: SimCfg, B: int, L: int, snr_db: torch.Tensor, device) -> Dict[str, torch.Tensor]:
+    """
+    Generates:
+      Rhat: sample covariance
+      Rin_true: true interference+noise covariance (no desired signal)
+      a_true: desired steering with mismatch
+      a_nom: nominal desired steering
+      bar_a: averaged steering samples
+      A_j: interferer steering stack [B,N,3]
+      sigma_s2: desired power (linear)
+    """
+    N = cfg.N
+    dtype = torch.complex64
+
+    snr_lin = (10.0 ** (snr_db / 10.0)).to(torch.float32)
+    sigma_s2 = snr_lin * cfg.noise_var
+    sigma_s = torch.sqrt(sigma_s2).to(torch.float32)
+
+    theta_s_true = (
+        torch.tensor(cfg.theta_s_nom_deg, device=device, dtype=torch.float32)
+        + torch.randn(B, device=device, dtype=torch.float32) * cfg.mismatch_std_deg
+    )
+    a_true = steering_ula(N, cfg.d_over_lambda, theta_s_true, device, dtype=dtype)
+
+    theta_s_nom = torch.full((B,), float(cfg.theta_s_nom_deg), device=device, dtype=torch.float32)
+    a_nom = steering_ula(N, cfg.d_over_lambda, theta_s_nom, device, dtype=dtype)
+
+    inr_lin = 10.0 ** (cfg.INR_dB / 10.0)
+    sigma_i2 = inr_lin * cfg.noise_var
+
+    theta_j = [torch.full((B,), float(th), device=device, dtype=torch.float32) for th in cfg.theta_js_deg]
+    a_j = [steering_ula(N, cfg.d_over_lambda, th, device, dtype=dtype) for th in theta_j]
+    A_j = torch.stack(a_j, dim=-1)  # [B,N,3]
+
+    I = cplx_eye(N, device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+    Rin_true = cfg.noise_var * I
+    for aj in a_j:
+        Rin_true = Rin_true + sigma_i2 * (aj[:, :, None] * torch.conj(aj[:, None, :]))
+    Rin_true = hermitize(Rin_true)
+
+    s = sample_complex_gaussian((B, L), device, dtype=dtype) * sigma_s[:, None].to(dtype)
+    u = [sample_complex_gaussian((B, L), device, dtype=dtype) * math.sqrt(sigma_i2) for _ in range(3)]
+    n = sample_complex_gaussian((B, N, L), device, dtype=dtype) * math.sqrt(cfg.noise_var)
+
+    X = a_true[:, :, None] * s[:, None, :]
+    for aj, uj in zip(a_j, u):
+        X = X + aj[:, :, None] * uj[:, None, :]
+    X = X + n
+
+    Rhat = (X @ torch.conj(X.transpose(-1, -2))) / float(L)
+    Rhat = hermitize(Rhat)
+
+    M = cfg.a_samples_M
+    theta_samples = (
+        torch.tensor(cfg.theta_s_nom_deg, device=device, dtype=torch.float32)[None, None]
+        + torch.randn(B, M, device=device, dtype=torch.float32) * cfg.mismatch_std_deg
+    )
+    a_samps = steering_ula(N, cfg.d_over_lambda, theta_samples.reshape(-1), device, dtype=dtype).reshape(B, M, N)
+    bar_a = a_samps.mean(dim=1)
+    bar_a = bar_a / torch.linalg.norm(bar_a, dim=-1, keepdim=True).clamp_min(1e-12)
+
+    return {
+        "Rhat": Rhat,
+        "Rin_true": Rin_true,
+        "a_true": a_true,
+        "a_nom": a_nom,
+        "bar_a": bar_a,
+        "A_j": A_j,
+        "sigma_s2": sigma_s2.to(torch.float32),
+    }
+
+
+@torch.no_grad()
+def gen_scene_custom(cfg: SimCfg, B: int, L: int, snr_db: float, device,
+                     inr_db: Optional[float] = None,
+                     mismatch_std_deg: Optional[float] = None,
+                     theta_js_deg: Optional[Tuple[float, float, float]] = None) -> Dict[str, torch.Tensor]:
+    old_inr, old_mis, old_js = cfg.INR_dB, cfg.mismatch_std_deg, cfg.theta_js_deg
+    if inr_db is not None:
+        cfg.INR_dB = float(inr_db)
+    if mismatch_std_deg is not None:
+        cfg.mismatch_std_deg = float(mismatch_std_deg)
+    if theta_js_deg is not None:
+        cfg.theta_js_deg = tuple(theta_js_deg)
+
+    snr_tensor = torch.full((B,), float(snr_db), device=device)
+    batch = gen_scene_batch(cfg, B, L, snr_tensor, device)
+
+    cfg.INR_dB, cfg.mismatch_std_deg, cfg.theta_js_deg = old_inr, old_mis, old_js
+    return batch
+
+
+# =========================================================
+# Models: token mixing blocks + variants
+# =========================================================
+class SSMBlock(nn.Module):
+    def __init__(self, d_model: int, kernel_size: int = 7, expansion: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.ln = nn.LayerNorm(d_model)
+        self.dw = nn.Conv1d(d_model, d_model, kernel_size=kernel_size,
+                            padding=kernel_size // 2, groups=d_model)
+        self.pw1 = nn.Linear(d_model, d_model * expansion * 2)
+        self.pw2 = nn.Linear(d_model * expansion, d_model)
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.ln(x)
+        h = h + self.dw(h.transpose(1, 2)).transpose(1, 2)
+        u = self.pw1(h)
+        a, b = u.chunk(2, dim=-1)
+        h = F.silu(a) * torch.sigmoid(b)
+        h = self.pw2(h)
+        h = self.drop(h)
+        return x + h
+
+
+def eig_tokens(Rhat: torch.Tensor) -> torch.Tensor:
+    """Tokens [B,N,3] = [log_e, log_ratio, idx]."""
+    B, N, _ = Rhat.shape
+    evals = torch.linalg.eigvalsh(Rhat).real
+    evals = torch.flip(evals, dims=[-1])
+    log_e = safe_log(evals + 1e-8)
+    log_ratio = log_e - safe_log(evals.sum(dim=-1, keepdim=True) + 1e-8)
+    idx = (torch.arange(N, device=Rhat.device, dtype=torch.float32)[None, :] / max(1, N - 1)).expand(B, -1)
+    return torch.stack([log_e, log_ratio, idx], dim=-1)
+
+
+class EigenTokenSSM(nn.Module):
+    """Full proposed: token mixing -> tau,rho,lam_diag + embed."""
+    def __init__(self, N: int, d_model: int = 96, n_layers: int = 3, dropout: float = 0.05):
+        super().__init__()
+        self.N = N
+        self.proj = nn.Linear(3, d_model)
+        self.blocks = nn.ModuleList([SSMBlock(d_model, 7, 2, dropout) for _ in range(n_layers)])
+        self.ln_out = nn.LayerNorm(d_model)
+
+        self.head_tau = nn.Sequential(nn.Linear(d_model, d_model // 2), nn.SiLU(), nn.Linear(d_model // 2, 1))
+        self.head_rho = nn.Sequential(nn.Linear(d_model, d_model // 2), nn.SiLU(), nn.Linear(d_model // 2, 1))
+        self.head_lam = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, N))
+
+        self.tau_scale = 2.0
+        self.rho_scale = 0.5
+
+    def forward(self, Rhat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        tok = eig_tokens(Rhat)
+        x = self.proj(tok)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.ln_out(x)
+        g = x.mean(dim=1)
+
+        tau = F.softplus(self.head_tau(g)).squeeze(-1) * self.tau_scale + 1e-6
+        rho = F.softplus(self.head_rho(g)).squeeze(-1) * self.rho_scale + 1e-6
+        lam = F.softplus(self.head_lam(g)) + 1e-4
+        return {"tau": tau, "rho": rho, "lam_diag": lam, "embed": g}
+
+
+class EigenTokenSSM_NoLam(EigenTokenSSM):
+    """Ablation: lam fixed ones, still mixing."""
+    def forward(self, Rhat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        out = super().forward(Rhat)
+        B, N, _ = Rhat.shape
+        out["lam_diag"] = torch.ones(B, N, device=Rhat.device, dtype=torch.float32)
+        return out
+
+
+class EigenMLPParam(nn.Module):
+    """Reduced: learn tau,rho only from per-token MLP (no mixing), lam=1."""
+    def __init__(self, N: int, hidden: int = 128, dropout: float = 0.05):
+        super().__init__()
+        self.N = N
+        self.fc1 = nn.Linear(3, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.drop = nn.Dropout(dropout)
+        self.out_tau = nn.Linear(hidden, 1)
+        self.out_rho = nn.Linear(hidden, 1)
+        self.tau_scale = 2.0
+        self.rho_scale = 0.5
+
+    def forward(self, Rhat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        tok = eig_tokens(Rhat)
+        h = F.silu(self.fc1(tok))
+        h = self.drop(F.silu(self.fc2(h)))
+        g = h.mean(dim=1)
+        tau = F.softplus(self.out_tau(g)).squeeze(-1) * self.tau_scale + 1e-6
+        rho = F.softplus(self.out_rho(g)).squeeze(-1) * self.rho_scale + 1e-6
+        B, N, _ = Rhat.shape
+        lam = torch.ones(B, N, device=Rhat.device, dtype=torch.float32)
+        return {"tau": tau, "rho": rho, "lam_diag": lam, "embed": g}
+
+
+class EigenTokenMLP(nn.Module):
+    """Ablation: NO mixing. Per-token MLP -> mean pool -> heads for tau,rho,lam."""
+    def __init__(self, N: int, d_model: int = 96, hidden: int = 192, dropout: float = 0.05):
+        super().__init__()
+        self.N = N
+        self.mlp = nn.Sequential(
+            nn.Linear(3, hidden), nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model), nn.SiLU(),
+        )
+        self.head_tau = nn.Sequential(nn.Linear(d_model, d_model // 2), nn.SiLU(), nn.Linear(d_model // 2, 1))
+        self.head_rho = nn.Sequential(nn.Linear(d_model, d_model // 2), nn.SiLU(), nn.Linear(d_model // 2, 1))
+        self.head_lam = nn.Sequential(nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, N))
+        self.tau_scale = 2.0
+        self.rho_scale = 0.5
+
+    def forward(self, Rhat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        tok = eig_tokens(Rhat)
+        x = self.mlp(tok)
+        g = x.mean(dim=1)
+        tau = F.softplus(self.head_tau(g)).squeeze(-1) * self.tau_scale + 1e-6
+        rho = F.softplus(self.head_rho(g)).squeeze(-1) * self.rho_scale + 1e-6
+        lam = F.softplus(self.head_lam(g)) + 1e-4
+        return {"tau": tau, "rho": rho, "lam_diag": lam, "embed": g}
+
+
+class OnlyRhoModel(nn.Module):
+    """Ablation: learn rho only. tau=0, lam=1."""
+    def __init__(self, N: int, hidden: int = 128, dropout: float = 0.05):
+        super().__init__()
+        self.N = N
+        self.fc1 = nn.Linear(3, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.drop = nn.Dropout(dropout)
+        self.out_rho = nn.Linear(hidden, 1)
+        self.rho_scale = 0.5
+
+    def forward(self, Rhat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        tok = eig_tokens(Rhat)
+        h = F.silu(self.fc1(tok))
+        h = self.drop(F.silu(self.fc2(h)))
+        g = h.mean(dim=1)
+        rho = F.softplus(self.out_rho(g)).squeeze(-1) * self.rho_scale + 1e-6
+        B, N, _ = Rhat.shape
+        tau = torch.zeros(B, device=Rhat.device, dtype=torch.float32)
+        lam = torch.ones(B, N, device=Rhat.device, dtype=torch.float32)
+        return {"tau": tau, "rho": rho, "lam_diag": lam, "embed": g}
+
+# =========================================================
+# CVCNN baseline (Mohammadzadeh et al. SPL 2022)
+# =========================================================
+class CVCNNBeamformer(nn.Module):
+    """CVCNN baseline from Mohammadzadeh et al. (2022 SPL).
+    1D Conv on flattened SCM (real + imag stacked as channels) -> complex weights.
+    End-to-end trained to maximize SINR (consistent with other data-driven baselines).
+    """
+    def __init__(self, N: int = 10):
+        super().__init__()
+        self.N = N
+        input_len = N * N                     # full SCM vectorized
+
+        # Real-valued 1D Conv on [real, imag] channels (practical approximation of complex conv)
+        self.conv1 = nn.Conv1d(2, 64, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.conv4 = nn.Conv1d(256, 256, kernel_size=3, padding=1)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc1 = nn.Linear(256, 512)
+        self.fc2 = nn.Linear(512, 2 * N)      # real + imag of w
+
+        self.dropout = nn.Dropout(0.25)
+
+    def forward(self, Rhat: torch.Tensor, a_nom: torch.Tensor = None) -> torch.Tensor:
+        B, N, _ = Rhat.shape
+        # Flatten Hermitian matrix -> complex vector [B, N*N]
+        r_flat = Rhat.reshape(B, -1)                     # complex
+
+        # Stack real/imag as 2 channels -> [B, 2, input_len]
+        x = torch.stack([r_flat.real, r_flat.imag], dim=1)
+
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.max_pool1d(x, kernel_size=2, stride=2)
+        x = F.relu(self.conv3(x))
+        x = F.relu(self.conv4(x))
+
+        x = self.pool(x).squeeze(-1)                     # [B, 256]
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        y = self.fc2(x)
+
+        w = torch.complex(y[:, :N], y[:, N:])
+
+        # Distortionless constraint w.r.t. nominal steering vector (like MVDR)
+        if a_nom is not None:
+            denom = (torch.conj(w) * a_nom).sum(dim=-1).real.clamp_min(1e-8)
+            w = w / denom.unsqueeze(-1)
+
+        return w
+
+
+
+@torch.no_grad()
+def irani_dro_weight(
+    Rhat: torch.Tensor,
+    a_nom: torch.Tensor,
+    rho1: float = None,
+    rho2: float = None,
+    gamma1: float = None,
+    gamma2: float = 0.1,
+    Delta: float = 0.1,
+    alpha: float = 1e3,
+    eta: float = 1e-6,
+    max_iter: int = 50,
+) -> torch.Tensor:
+    """
+    Irani et al. (IEEE TSP 2025) - SINR Maximizing Distributionally Robust Adaptive Beamforming
+    Fully fixed:
+      - M2 / M2_pen scalar blocks now use explicit (1,1) arrays
+      - All inequality constraints are explicitly real-valued via cp.real(...)
+    """
+    device = Rhat.device
+    dtype = torch.complex64
+    B, N, _ = Rhat.shape
+
+    # Default parameters (paper-consistent)
+    S0_np = Rhat[0].cpu().numpy().astype(np.complex128)
+    a0_np = a_nom[0].cpu().numpy().astype(np.complex128)
+
+    if rho1 is None:
+        rho1 = 0.001 * np.linalg.norm(S0_np, 'fro')
+    if rho2 is None:
+        rho2 = 1.1 * np.trace(S0_np).real
+    if gamma1 is None:
+        gamma1 = 0.01 * np.linalg.norm(a0_np)
+
+    w_list = []
+    for b in range(B):
+        S0 = Rhat[b].cpu().numpy().astype(np.complex128)
+        a0 = a_nom[b].cpu().numpy().astype(np.complex128)
+
+        # ============== Variables ==============
+        W = cp.Variable((N, N), hermitian=True)
+        X = cp.Variable((N, N), hermitian=True)
+        Z = cp.Variable((N, N), hermitian=True)
+        x = cp.Variable(N, complex=True)
+        tau1 = cp.Variable(1, nonneg=False)
+        tau2 = cp.Variable(1, nonneg=False)
+
+        # ============== Objective ==============
+        obj = rho1 * cp.norm(X, 'fro') + rho2 * cp.norm(W + X, 'fro') - cp.real(cp.trace(X @ S0))
+
+        # ============== Constraints (main) ==============
+        constraints = []
+        # steering vector dual constraint (real-valued)
+        real_part = cp.real(x.conj().T @ a0) - gamma1 * cp.norm(x)
+        constraints.append(
+            real_part - cp.real(
+                cp.trace(Z @ ((1 + gamma2) * np.eye(N) + np.outer(a0, a0.conj())))
+            ) >= 1
+        )
+
+        # LMI for support set Z2 (Eq.33 + Eq.34)
+        I = np.eye(N, dtype=np.complex128)
+        M1 = cp.bmat([
+            [W + Z, -cp.reshape(x, (N, 1), order="F")],
+            [-cp.reshape(cp.conj(x), (1, N), order="F"),
+             cp.reshape(-(1 + Delta) * N, (1, 1), order="F")]
+        ])
+        M2 = cp.bmat([                                      # FIXED: scalar → (1,1) array
+            [-I, np.zeros((N, 1))],
+            [np.zeros((1, N)), np.array([[float((1 - Delta) * N)]])]
+        ])
+        constraints.append(M1 >> tau1 * M2 + tau2 * (-M2))
+        constraints.append(tau1 <= 0)
+        constraints.append(tau2 <= 0)
+
+        constraints += [W >> 0, Z >> 0, X >> 0]
+
+        prob = cp.Problem(cp.Minimize(obj), constraints)
+        prob.solve(solver=cp.SCS, verbose=False)
+
+        W_star = W.value
+
+        # ============== Algorithm 1: rank-1 extraction (penalty) ==============
+        if np.abs(np.trace(W_star) - np.linalg.norm(W_star, 'fro')) < 1e-5:
+            w = np.linalg.eigh(W_star)[1][:, -1]
+        else:
+            Wk = W_star.copy()
+            for it in range(max_iter):
+                W_var = cp.Variable((N, N), hermitian=True)
+                X_var = cp.Variable((N, N), hermitian=True)
+                Z_var = cp.Variable((N, N), hermitian=True)
+                x_var = cp.Variable(N, complex=True)
+                tau1_var = cp.Variable(1, nonneg=False)
+                tau2_var = cp.Variable(1, nonneg=False)
+
+                obj_pen = (rho1 * cp.norm(X_var, 'fro') +
+                           rho2 * cp.norm(W_var + X_var, 'fro') -
+                           cp.real(cp.trace(X_var @ S0)) +
+                           alpha * (cp.real(cp.trace(W_var)) -
+                                    cp.real(cp.trace(W_var @ Wk)) / np.linalg.norm(Wk, 'fro')))
+
+                # FIXED: explicitly real-valued inequality
+                cons_pen = [
+                    cp.real(x_var.conj().T @ a0) - gamma1 * cp.norm(x_var) -
+                    cp.real(cp.trace(Z_var @ ((1 + gamma2) * np.eye(N) + np.outer(a0, a0.conj())))) >= 1
+                ]
+
+                M1_pen = cp.bmat([
+                    [W_var + Z_var, -cp.reshape(x_var, (N, 1), order="F")],
+                    [-cp.reshape(cp.conj(x_var), (1, N), order="F"),
+                     cp.reshape(-(1 + Delta) * N, (1, 1), order="F")]
+                ])
+                M2_pen = cp.bmat([                          # FIXED: scalar → (1,1) array
+                    [-np.eye(N), np.zeros((N, 1))],
+                    [np.zeros((1, N)), np.array([[float((1 - Delta) * N)]])]
+                ])
+                cons_pen.append(M1_pen >> tau1_var * M2_pen + tau2_var * (-M2_pen))
+                cons_pen += [tau1_var <= 0, tau2_var <= 0]
+                cons_pen += [W_var >> 0, Z_var >> 0, X_var >> 0]
+
+                prob_pen = cp.Problem(cp.Minimize(obj_pen), cons_pen)
+                prob_pen.solve(solver=cp.SCS, verbose=False)
+
+                W_next = W_var.value
+                if W_next is None or not np.all(np.isfinite(W_next)):
+                    break
+                if np.abs(np.trace(W_next) - np.linalg.norm(W_next, 'fro')) < eta:
+                    Wk = W_next
+                    break
+                Wk = W_next
+
+            eigvals, eigvecs = np.linalg.eigh(Wk)
+            w = eigvecs[:, -1]
+
+        # distortionless normalization
+        w = w / (w.conj().T @ a0)
+        w_list.append(w)
+
+    w_torch = torch.tensor(np.stack(w_list), dtype=torch.complex64, device=device)
+    return w_torch
+
+# =========================================================
+# Differentiable robust beamformer (SOC-style scaling on MVDR ray)
+# =========================================================
+def robust_beamformer_from_params(Rhat, bar_a, tau, rho, lam_diag) -> torch.Tensor:
+    """
+    v = (Rhat + rho I)^-1 bar_a
+    alpha = 1 / ( softplus( Re(v^H bar_a) - tau * sqrt(sum |v|^2 / lam) ) + eps )
+    w = alpha v
+    """
+    B, N, _ = Rhat.shape
+    dtype = Rhat.dtype
+    I = cplx_eye(N, Rhat.device, dtype=dtype)[None].expand(B, -1, -1)
+
+    Rl = Rhat + rho[:, None, None].to(dtype) * I
+    v = solve(Rl, bar_a)
+    vhb = (torch.conj(v) * bar_a).sum(dim=-1).real
+
+    inv_lam = 1.0 / lam_diag.clamp_min(1e-6)
+    maha = torch.sqrt((abs2(v) * inv_lam).sum(dim=-1).clamp_min(1e-12))
+
+    denom_raw = vhb - tau * maha
+    denom = F.softplus(denom_raw) + 1e-6
+    alpha = 1.0 / denom
+    return v * alpha[:, None].to(dtype)
+
+
+# =========================================================
+# Baselines
+# =========================================================
+def mvdr_weight(R: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
+    """
+    MVDR: w = R^{-1} a / (a^H R^{-1} a)
+    """
+    x = solve(R, a)  # R^{-1} a
+    denom = (torch.conj(a) * x).sum(dim=-1)  # complex, should be ~real
+    denom_real = denom.real.clamp_min(1e-12)
+    return x / denom_real.unsqueeze(-1).to(x.dtype)
+
+
+def dl_mvdr_weight(Rhat: torch.Tensor, a: torch.Tensor, rho: float) -> torch.Tensor:
+    B, N, _ = Rhat.shape
+    I = cplx_eye(N, Rhat.device, dtype=Rhat.dtype)[None].expand(B, -1, -1)
+    return mvdr_weight(Rhat + rho * I, a)
+
+
+def lsmi_weight(Rhat: torch.Tensor, a: torch.Tensor, beta: float = 0.1) -> torch.Tensor:
+    B, N, _ = Rhat.shape
+    I = cplx_eye(N, Rhat.device, dtype=Rhat.dtype)[None].expand(B, -1, -1)
+    tr = trace_batch(Rhat).real
+    delta = beta * (tr / float(N)).to(torch.float32)
+    Rl = Rhat + delta[:, None, None].to(Rhat.dtype) * I
+    return mvdr_weight(Rl, a)
+
+
+def rcb_weight(Rhat: torch.Tensor, a_nom: torch.Tensor, eps: float = 0.15) -> torch.Tensor:
+    v = solve(Rhat, a_nom)
+    v = v / torch.linalg.norm(v, dim=-1, keepdim=True).clamp_min(1e-12)
+    a_worst = a_nom - eps * v
+    a_worst = a_worst / torch.linalg.norm(a_worst, dim=-1, keepdim=True).clamp_min(1e-12)
+    return mvdr_weight(Rhat, a_worst)
+
+
+def subspace_mvdr_weight(Rhat: torch.Tensor, a: torch.Tensor, K: int = 3) -> torch.Tensor:
+    B, N, _ = Rhat.shape
+    evals, evecs = torch.linalg.eigh(Rhat)
+    Ui = evecs[..., -(K):]
+    I = torch.eye(N, device=Rhat.device, dtype=Rhat.dtype)[None].expand(B, -1, -1)
+    P = I - Ui @ Ui.conj().transpose(-1, -2)
+    Rproj = hermitize(P @ Rhat @ P)
+    aproj = (P @ a.unsqueeze(-1)).squeeze(-1)
+    return mvdr_weight(Rproj + 1e-6 * I, aproj)
+
+
+def shrinkage_mvdr_weight(Rhat: torch.Tensor, a: torch.Tensor, alpha: float = 0.1) -> torch.Tensor:
+    B, N, _ = Rhat.shape
+    dtype = Rhat.dtype
+    I = cplx_eye(N, Rhat.device, dtype=dtype)[None].expand(B, -1, -1)
+    tr = trace_batch(Rhat).real.clamp_min(1e-12)
+    mu = (tr / float(N)).to(torch.float32)
+    Rsh = (1.0 - alpha) * Rhat + alpha * mu[:, None, None].to(dtype) * I
+    Rsh = hermitize(Rsh)
+    return mvdr_weight(Rsh, a)
+
+
+def lcmv_weight(R: torch.Tensor, C: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
+    Rinvc = torch.linalg.solve(R, C)
+    G = C.conj().transpose(-1, -2) @ Rinvc
+    x = torch.linalg.solve(G, f.unsqueeze(-1)).squeeze(-1)
+    w = Rinvc @ x.unsqueeze(-1)
+    return w.squeeze(-1)
+
+
+def rvo_lcmv_weight(Rhat: torch.Tensor, a_nom: torch.Tensor, A_j: torch.Tensor,
+                    eps: float = 0.15, rho: float = 1e-3) -> torch.Tensor:
+    B, N, _ = Rhat.shape
+    dtype = Rhat.dtype
+    I = cplx_eye(N, Rhat.device, dtype=dtype)[None].expand(B, -1, -1)
+    Rl = hermitize(Rhat + rho * I)
+    v = solve(Rl, a_nom)
+
+    A = A_j
+    AH_A = A.conj().transpose(-1, -2) @ A
+    ridge = 1e-3 * torch.eye(3, device=Rhat.device, dtype=dtype)[None].expand(B, -1, -1)
+    inv_AH_A = torch.linalg.inv(AH_A + ridge)
+    Pperp = I - A @ inv_AH_A @ A.conj().transpose(-1, -2)
+
+    g = (Pperp @ v.unsqueeze(-1)).squeeze(-1)
+    g_unit = g / torch.linalg.norm(g, dim=-1, keepdim=True).clamp_min(1e-12)
+
+    a_tilde = a_nom - eps * g_unit
+    a_tilde = a_tilde / torch.linalg.norm(a_tilde, dim=-1, keepdim=True).clamp_min(1e-12)
+
+    C = torch.cat([a_tilde.unsqueeze(-1), A], dim=-1)
+    f = torch.zeros(B, 4, device=Rhat.device, dtype=dtype)
+    f[:, 0] = 1.0 + 0.0j
+    return lcmv_weight(Rl, C, f)
+
+
+# =========================================================
+# New SOTA baselines:
+#   1) IPN-UDL (TSP2025)
+#   2) IRDRCB-Krylov (Sensors2024)
+#   3) WC-QMI-A1-LMI (TSP2023)
+# =========================================================
+
+def default_ula_positions_2d(N: int, d_over_lambda: float, device):
+    """Return [N,2] ULA positions in wavelength units."""
+    x = torch.arange(N, device=device, dtype=torch.float32) * float(d_over_lambda)
+    y = torch.zeros_like(x)
+    return torch.stack([x, y], dim=-1)
+
+
+def steering_from_positions_safe(pos_nom: torch.Tensor,
+                                 theta_deg: torch.Tensor,
+                                 device,
+                                 dtype=torch.complex64) -> torch.Tensor:
+    """
+    pos_nom: [N,2] in wavelength units.
+    theta_deg: [G] or [B].
+    return: [G,N] or [B,N], normalized to ||a||=1.
+    """
+    theta = theta_deg.to(device=device, dtype=torch.float32) * math.pi / 180.0
+    ux = torch.sin(theta)[:, None]
+    uy = torch.cos(theta)[:, None]
+
+    phase = 2.0 * math.pi * (
+        ux * pos_nom[None, :, 0] + uy * pos_nom[None, :, 1]
+    )
+    a = torch.exp(1j * phase.to(torch.complex64))
+    a = a / torch.linalg.norm(a, dim=-1, keepdim=True).clamp_min(1e-12)
+    return a.to(dtype)
+
+
+@torch.no_grad()
+def ipn_udl_weight(
+    Rhat: torch.Tensor,
+    a_nom: torch.Tensor,
+    pos_nom: Optional[torch.Tensor] = None,
+    theta_s_nom_deg: float = -5.0,
+    d_over_lambda: float = 0.5,
+    soi_exclude_deg: float = 10.0,
+    grid_step_deg: float = 2.0,
+    K_udl: int = 3,
+    delta1_rel: float = 10.0,
+    delta2_rel: float = 1e-2,
+    final_dl_rel: float = 1e-3,
+) -> torch.Tensor:
+    """
+    IPN-UDL baseline inspired by Wang-Dai-Li TSP 2025.
+
+    Steps:
+      1) UDL high-resolution Capon spectrum:
+             Gamma = U_s delta1 U_s^H + U_n delta2 U_n^H
+             P(theta) = 1 / a^H (Rhat + Gamma)^(-1) a
+      2) Reconstruct IPN covariance outside SOI sector.
+      3) Final diagonally-loaded MVDR using reconstructed IPN.
+
+    Note:
+      - This matches existing CMR-Capon style, but replaces the Capon
+        spectrum matrix Rhat with Rhat + Gamma and adds final DL.
+      - pos_nom is optional. If not provided, a ULA is assumed.
+    """
+    B, N, _ = Rhat.shape
+    device = Rhat.device
+    dtype = Rhat.dtype
+
+    if pos_nom is None:
+        pos_nom = default_ula_positions_2d(N, d_over_lambda, device)
+
+    I = cplx_eye(N, device, dtype=dtype)[None].expand(B, -1, -1)
+
+    # ---------- UDL matrix Gamma ----------
+    evals, evecs = torch.linalg.eigh(hermitize(Rhat))  # ascending
+    idx = torch.argsort(evals, dim=-1, descending=True)
+    evecs_desc = torch.gather(
+        evecs, 2, idx[:, None, :].expand(B, N, N)
+    )
+    K = min(max(1, K_udl), N - 1)
+    Us = evecs_desc[:, :, :K]
+    Un = evecs_desc[:, :, K:]
+
+    scale = (trace_batch(Rhat).real / float(N)).clamp_min(1e-8)
+    delta1 = delta1_rel * scale
+    delta2 = delta2_rel * scale
+
+    Gamma = (
+        delta1[:, None, None].to(dtype) * (Us @ Us.conj().transpose(-1, -2))
+        + delta2[:, None, None].to(dtype) * (Un @ Un.conj().transpose(-1, -2))
+    )
+    Rudl = hermitize(Rhat + Gamma + 1e-6 * scale[:, None, None].to(dtype) * I)
+
+    # ---------- angular grid outside SOI sector ----------
+    grid = torch.arange(-90.0, 90.0 + 1e-6, grid_step_deg, device=device)
+    mask = torch.abs(grid - float(theta_s_nom_deg)) > float(soi_exclude_deg)
+    grid_i = grid[mask]
+    A = steering_from_positions_safe(pos_nom, grid_i, device, dtype=dtype)  # [G,N]
+    G = A.shape[0]
+
+    # ---------- UDL-Capon spectrum ----------
+    rhs = A.t().unsqueeze(0).expand(B, -1, -1)  # [B,N,G]
+    RinvA = torch.linalg.solve(Rudl, rhs)
+    denom = (A.conj().t().unsqueeze(0) * RinvA).sum(dim=1).real.clamp_min(1e-8)
+    P = 1.0 / denom
+    P = P / P.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    # ---------- IPN covariance reconstruction ----------
+    Rrec = torch.zeros_like(Rhat)
+    for g in range(G):
+        ag = A[g][None, :].expand(B, -1)
+        Rrec = Rrec + P[:, g][:, None, None].to(dtype) * (
+            ag[:, :, None] * ag.conj()[:, None, :]
+        )
+    Rrec = Rrec / float(G)
+
+    noise_floor = evals[:, :max(1, N // 3)].mean(dim=-1).clamp_min(1e-8)
+    final_dl = final_dl_rel * scale
+    Rrec = hermitize(
+        Rrec
+        + noise_floor[:, None, None].to(dtype) * I
+        + final_dl[:, None, None].to(dtype) * I
+    )
+
+    return mvdr_weight(Rrec, a_nom)
+
+
+def _krylov_basis_single(R: torch.Tensor, a: torch.Tensor, rank: int) -> torch.Tensor:
+    """
+    Build an orthonormal Krylov basis span{a, R a, R^2 a, ...}.
+    R: [N,N], a: [N]
+    return D: [N,K]
+    """
+    N = a.numel()
+    K = min(rank, N)
+    vecs = []
+
+    v = a / torch.linalg.norm(a).clamp_min(1e-12)
+    for _ in range(K):
+        # Modified Gram-Schmidt
+        q = v.clone()
+        for u in vecs:
+            q = q - u * (torch.conj(u) @ q)
+        nq = torch.linalg.norm(q)
+        if nq < 1e-8:
+            break
+        q = q / nq
+        vecs.append(q)
+        v = R @ q
+
+    if len(vecs) == 0:
+        vecs = [a / torch.linalg.norm(a).clamp_min(1e-12)]
+
+    return torch.stack(vecs, dim=-1)
+
+
+@torch.no_grad()
+def irdrcb_krylov_weight(
+    Rhat: torch.Tensor,
+    a_nom: torch.Tensor,
+    rank: int = 6,
+    loading_rel_low: float = 1e-6,
+    loading_rel_high: float = 1e2,
+    norm_bound: float = 10.0,
+    bisect_iters: int = 35,
+) -> torch.Tensor:
+    """
+    Practical IRDRCB-Krylov baseline.
+
+    This is a reduced-dimension robust Capon implementation:
+      1) Build Krylov subspace D.
+      2) Solve reduced-rank diagonally loaded MVDR.
+      3) Use bisection to keep the loading level valid and control ||w||^2.
+
+    It is intentionally stable for Monte-Carlo simulations.
+    Name in paper/table: IRDRCB-Krylov.
+    """
+    B, N, _ = Rhat.shape
+    device = Rhat.device
+    dtype = Rhat.dtype
+
+    w_list = []
+    for b in range(B):
+        Rb = hermitize(Rhat[b])
+        ab = a_nom[b]
+
+        scale = (torch.trace(Rb).real / float(N)).clamp_min(1e-8)
+        D = _krylov_basis_single(Rb, ab, rank=rank)  # [N,K]
+        K = D.shape[-1]
+
+        Rr = hermitize(D.conj().transpose(-1, -2) @ Rb @ D)
+        ar = D.conj().transpose(-1, -2) @ ab
+        Ir = torch.eye(K, device=device, dtype=dtype)
+
+        lo = loading_rel_low * scale
+        hi = loading_rel_high * scale
+
+        def reduced_weight(mu):
+            xr = torch.linalg.solve(Rr + mu.to(dtype) * Ir, ar)
+            den = (torch.conj(ar) * xr).sum().real.clamp_min(1e-12)
+            wr = xr / den.to(dtype)
+            wf = D @ wr
+            den2 = (torch.conj(wf) * ab).sum()
+            wf = wf / (torch.conj(den2) + 1e-8)
+            return wf
+
+        # If low loading already satisfies norm bound, use it.
+        w_lo = reduced_weight(lo)
+        if (torch.linalg.norm(w_lo).real ** 2) <= norm_bound:
+            w_list.append(w_lo)
+            continue
+
+        # Bisection on loading. Larger loading usually lowers white-noise sensitivity.
+        for _ in range(bisect_iters):
+            mid = 0.5 * (lo + hi)
+            wm = reduced_weight(mid)
+            if (torch.linalg.norm(wm).real ** 2) > norm_bound:
+                lo = mid
+            else:
+                hi = mid
+
+        w_list.append(reduced_weight(hi))
+
+    return torch.stack(w_list, dim=0).to(dtype)
+
+
+@torch.no_grad()
+def wc_qmi_a1_lmi_weight(
+    Rhat: torch.Tensor,
+    a_nom: torch.Tensor,
+    delta_frac: float = 0.30,
+    eta1_frac: float = 0.20,
+    eta2_frac: float = 0.20,
+    cov_dl_rel: float = 0.10,
+    solver: str = "SCS",
+    verbose: bool = False,
+    max_iters: int = 500,
+    eps: float = 1e-3,
+) -> torch.Tensor:
+    """
+    Worst-case SINR with nonconvex steering uncertainty set A1:
+        ||a-a_hat||^2 <= Delta,
+        norm2-eta1 <= ||a||^2 <= norm2+eta2.
+
+    This implements the tightened LMI relaxation of the QMI-A1 formulation.
+    It extracts the principal rank-one approximation if W is not numerically rank-one.
+
+    Important:
+       steering vectors are normalized to ||a||=1, while the paper often uses
+      ||a||^2=N. Therefore Delta/eta are scaled by norm2 = ||a_nom||^2.
+    """
+    B, N, _ = Rhat.shape
+    device = Rhat.device
+    dtype = torch.complex64
+
+    w_list = []
+
+    for b in range(B):
+        R_np = hermitize(Rhat[b]).detach().cpu().numpy().astype(np.complex128)
+        a_np = a_nom[b].detach().cpu().numpy().astype(np.complex128)
+
+        norm2 = float(np.vdot(a_np, a_np).real)
+        Delta = float(delta_frac * norm2)
+        eta1 = float(eta1_frac * norm2)
+        eta2 = float(eta2_frac * norm2)
+
+        # covariance uncertainty loading: R_hat in the paper can include sqrt(gamma) I
+        lam_min = max(float(np.linalg.eigvalsh(R_np).min().real), 1e-8)
+        R_np = R_np + (cov_dl_rel * lam_min) * np.eye(N, dtype=np.complex128)
+        R_np = 0.5 * (R_np + R_np.conj().T)
+
+        W = cp.Variable((N, N), hermitian=True)
+        y1 = cp.Variable()
+        y2 = cp.Variable()
+        y3 = cp.Variable()
+        y4 = cp.Variable()
+
+        top_left = W - (y1 + y2 + y3) * np.eye(N)
+        top_right = cp.reshape(y1 * a_np, (N, 1), order="F")
+        bottom_left = cp.reshape(y1 * a_np.conj(), (1, N), order="F")
+        bottom_right = cp.reshape(
+            -y4 - y1 * (norm2 - Delta), (1, 1), order="F"
+        )
+
+        Q = cp.bmat([
+            [top_left, top_right],
+            [bottom_left, bottom_right],
+        ])
+
+        constraints = [
+            (norm2 - eta1) * y2 + (norm2 + eta2) * y3 + y4 == 1,
+            Q >> 0,
+            W >> 0,
+            y1 <= 0,
+            y2 >= 0,
+            y3 <= 0,
+            y1 + y2 + y3 <= 0,   # tightened valid linear constraint
+        ]
+
+        obj = cp.Minimize(cp.real(cp.trace(R_np @ W)))
+        prob = cp.Problem(obj, constraints)
+
+        try:
+            prob.solve(
+                solver=solver,
+                verbose=verbose,
+                max_iters=max_iters,
+                eps=eps,
+                warm_start=True,
+            )
+            Wv = W.value
+            if Wv is None or not np.all(np.isfinite(Wv)):
+                raise RuntimeError("WC-QMI solver returned invalid W")
+
+            Wv = 0.5 * (Wv + Wv.conj().T)
+            vals, vecs = np.linalg.eigh(Wv)
+            idx = int(np.argmax(vals.real))
+            val = max(float(vals[idx].real), 1e-12)
+            w = np.sqrt(val) * vecs[:, idx]
+
+            # distortionless normalization
+            den = np.vdot(w, a_np)
+            if abs(den) < 1e-10:
+                raise RuntimeError("WC-QMI normalization failed")
+            w = w / den.conj()
+
+        except Exception:
+            # stable fallback: do not crash Monte Carlo
+            R_t = torch.tensor(R_np[None], device=device, dtype=dtype)
+            a_t = torch.tensor(a_np[None], device=device, dtype=dtype)
+            w = mvdr_weight(R_t, a_t)[0].detach().cpu().numpy()
+
+        w_list.append(w.astype(np.complex64))
+
+    return torch.tensor(np.stack(w_list), device=device, dtype=dtype)
+
+# =========================================================
+# Metrics
+# =========================================================
+def sinr_out_db(w, a_true, Rin_true, sigma_s2) -> torch.Tensor:
+    num = sigma_s2 * abs2((torch.conj(w) * a_true).sum(dim=-1))
+    den = quad_form(w, Rin_true).clamp_min(1e-12)
+    sinr = (num / den).clamp_min(1e-12)
+    return 10.0 * torch.log10(sinr)
+
+
+def catastrophic_rate(sinr_db: np.ndarray, thr_db: float = -5.0) -> float:
+    s = np.asarray(sinr_db).reshape(-1)
+    return float(100.0 * np.mean(s < thr_db))
+
+
+# =========================================================
+# Training (maximize mean SINR)
+# =========================================================
+def train_model(model: nn.Module, cfg: SimCfg, device,
+                epochs: int, steps_per_epoch: int, batch_size: int,
+                L_choices: Tuple[int, ...], snr_range: Tuple[float, float],
+                lr: float = 3e-4) -> Dict[str, List[float]]:
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    hist = {"train": [], "val": []}
+
+    def val_step(num_batches: int = 20) -> float:
+        model.eval()
+        vals = []
+        with torch.no_grad():
+            for _ in range(num_batches):
+                L = random.choice(L_choices)
+                snr = snr_range[0] + (snr_range[1] - snr_range[0]) * torch.rand(batch_size, device=device)
+                batch = gen_scene_batch(cfg, batch_size, L, snr, device)
+                out = model(batch["Rhat"])
+                w = robust_beamformer_from_params(batch["Rhat"], batch["bar_a"], out["tau"], out["rho"], out["lam_diag"])
+                sinr = sinr_out_db(w, batch["a_true"], batch["Rin_true"], batch["sigma_s2"])
+                vals.append((-sinr.mean()).item())
+        model.train()
+        return float(np.mean(vals))
+
+    for ep in range(1, epochs + 1):
+        losses = []
+        for _ in range(steps_per_epoch):
+            L = random.choice(L_choices)
+            snr = snr_range[0] + (snr_range[1] - snr_range[0]) * torch.rand(batch_size, device=device)
+            batch = gen_scene_batch(cfg, batch_size, L, snr, device)
+
+            out = model(batch["Rhat"])
+            w = robust_beamformer_from_params(batch["Rhat"], batch["bar_a"], out["tau"], out["rho"], out["lam_diag"])
+            sinr = sinr_out_db(w, batch["a_true"], batch["Rin_true"], batch["sigma_s2"])
+            loss_main = -sinr.mean()
+
+            reg = 1e-4 * (out["rho"] ** 2).mean() + 1e-4 * (out["tau"] ** 2).mean()
+            reg = reg + 1e-5 * (safe_log(out["lam_diag"]) ** 2).mean()
+            loss = loss_main + reg
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            losses.append(loss_main.item())
+
+        v = val_step()
+        hist["train"].append(float(np.mean(losses)))
+        hist["val"].append(v)
+        print(f"Epoch {ep:03d}/{epochs} | train(-mean SINR dB)={hist['train'][-1]:.3f} | val={v:.3f}")
+
+    return hist
+
+
+# =========================================================
+# Evaluation
+# =========================================================
+@torch.no_grad()
+def eval_methods_once(cfg: SimCfg, device, snr_db: float, L: int, mc: int,
+                      model_dict: Dict[str, nn.Module],
+                      dl_rho_fixed: float = 0.1) -> Dict[str, np.ndarray]:
+    snr_t = torch.full((mc,), float(snr_db), device=device)
+    batch = gen_scene_batch(cfg, mc, L, snr_t, device)
+
+    res = {}
+
+    # Oracle optimal: true Rin + nominal a
+    w_opt = mvdr_weight(batch["Rin_true"], batch["a_nom"])
+    res["Optimal SINR"] = sinr_out_db(w_opt, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    # Baselines (fast)
+    w_smi = mvdr_weight(batch["Rhat"], batch["a_nom"])
+    res["SMI MVDR"] = sinr_out_db(w_smi, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_lsmi = lsmi_weight(batch["Rhat"], batch["a_nom"], beta=0.1)
+    res["LSMI"] = sinr_out_db(w_lsmi, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_rcb = rcb_weight(batch["Rhat"], batch["a_nom"], eps=0.15)
+    res["RCB"] = sinr_out_db(w_rcb, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_sub = subspace_mvdr_weight(batch["Rhat"], batch["a_nom"], K=3)
+    res["Subspace MVDR"] = sinr_out_db(w_sub, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_shr = shrinkage_mvdr_weight(batch["Rhat"], batch["a_nom"], alpha=0.1)
+    res["Shrinkage-MVDR"] = sinr_out_db(w_shr, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_rvo = rvo_lcmv_weight(batch["Rhat"], batch["a_nom"], batch["A_j"], eps=0.15, rho=1e-3)
+    res["RVO-LCMV"] = sinr_out_db(w_rvo, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_dl = dl_mvdr_weight(batch["Rhat"], batch["a_nom"], rho=dl_rho_fixed)
+    res[f"DL-MVDR(rho={dl_rho_fixed})"] = sinr_out_db(w_dl, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_udl = ipn_udl_weight(
+        batch["Rhat"], batch["a_nom"],
+        pos_nom=None,
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        d_over_lambda=cfg.d_over_lambda,
+        soi_exclude_deg=10.0,
+        grid_step_deg=2.0,
+        K_udl=3,
+    )
+    res["IPN-UDL (TSP2025)"] = sinr_out_db(
+        w_udl, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()
+
+    pos_nom0 = array_positions_2d(cfg.N, cfg.d_over_lambda, "ula", device)
+    w_meps = meps_ipnc_weight(
+        batch["Rhat"], batch["a_nom"], pos_nom0,
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        soi_sector_deg=6.0,
+        grid_i_step_deg=2.0,
+        grid_s_step_deg=1.0,
+        rho=1e-3,
+        estimate_sv=True,
+    )
+    res["MEPS-IPNC (SPL2020)"] = sinr_out_db(
+        w_meps, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()
+
+    w_pglq = pglq_incm_weight(
+        batch["Rhat"], batch["a_nom"], pos_nom0,
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        exclude_deg=6.0,
+        Q=3,
+        null_width_u=None,
+        signal_subspace_dim=4,
+        peak_gain=3.0,
+        rho=1e-3,
+    )
+    res["PGLQ-INCM (SP2026)"] = sinr_out_db(
+        w_pglq, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()
+
+    w_irdrcb = irdrcb_krylov_weight(
+        batch["Rhat"], batch["a_nom"],
+        rank=min(6, cfg.N),
+        norm_bound=10.0,
+    )
+    res["IRDRCB-Krylov (Sensors2024)"] = sinr_out_db(
+        w_irdrcb, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()
+
+    # ==================== 临时禁用最慢的 WC-QMI ====================
+    # w_wc = wc_qmi_a1_lmi_weight(...)   # ← 注释掉
+    res["WC-QMI-A1-LMI (TSP2023)"] = sinr_out_db(
+        w_smi, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()   # 临时用 SMI 代替，速度极快
+
+    # Proposed + ablations
+    for name, mdl in model_dict.items():
+        mdl.eval()
+        out = mdl(batch["Rhat"])
+        w = robust_beamformer_from_params(batch["Rhat"], batch["bar_a"], out["tau"], out["rho"], out["lam_diag"])
+        res[name] = sinr_out_db(w, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    return res
+
+
+# =========================================================
+# Plotting
+# =========================================================
+
+
+def plot_catastrophic_vs_snr(cat_dict: Dict[str, List[float]], snr_list: List[float],
+                             title: str, out_base: str):
+    set_pub_style()
+    plt.figure(figsize=(6.8, 4.4))
+
+    for name, y in cat_dict.items():
+        if name == "Proposed TM-DRO":
+            plt.plot(snr_list, y, label=name, linewidth=2.6, marker="o")
+        elif name == "Optimal SINR":
+            plt.plot(snr_list, y, label=name, linewidth=2.3)
+        else:
+            plt.plot(snr_list, y, label=name, linewidth=1.9)
+
+    plt.xlabel("SNR (dB)")
+    plt.ylabel("Catastrophic rate (%)")
+    ax = plt.gca()
+    apply_axis_style(ax)
+    legend_outside_bottom(ax, max_cols=4)
+    savefig_dual(out_base)
+    plt.close()
+
+
+def plot_cov_heatmaps(R_list: List[torch.Tensor], titles: List[str], out_base: str,
+                      vmin_db=-60, vmax_db=10):
+    set_pub_style()
+    K = len(R_list)
+    fig, axes = plt.subplots(1, K, figsize=(4.6 * K, 4.0), constrained_layout=True)
+    if K == 1:
+        axes = [axes]
+
+    im = None
+    for ax, R, tt in zip(axes, R_list, titles):
+        Rn = R.detach().cpu().numpy()
+        mag_db = 20.0 * np.log10(np.maximum(np.abs(Rn), 1e-12))
+        im = ax.imshow(mag_db, aspect="equal", vmin=vmin_db, vmax=vmax_db)
+        ax.set_xlabel("Sensor index")
+        ax.set_ylabel("Sensor index")
+        ax.set_title(tt)
+        # heatmap axes: grid not needed (would clutter)
+        ax.tick_params(which="both", direction="out")
+
+    cbar = fig.colorbar(im, ax=axes, shrink=0.90)
+    cbar.set_label(r"$20\log_{10}(|R_{ij}|)$ (dB)")
+
+    plt.savefig(out_base + ".pdf")
+    plt.savefig(out_base + ".png", dpi=450)
+    plt.close(fig)
+
+
+def plot_eigenspectra(R_list: List[torch.Tensor], labels: List[str], out_base: str,
+                      use_log=True, normalize_trace=True):
+    """
+    Plot trace-normalized eigenspectra with publication-style line/marker design.
+    Drop-in replacement for the original plot_eigenspectra().
+    """
+    set_pub_style()
+    plt.figure(figsize=(6.2, 4.1))
+
+    # Shorter legend labels
+    label_map = {
+        "Case A: noise-dom": "Noise-dominated",
+        "Case B: target+noise": "Target + noise",
+        "Case C: +interf+mismatch": "Interference + mismatch",
+    }
+
+    # Distinct color + marker + line style
+    style_map = {
+        "Noise-dominated": {
+            "color": "#1f77b4",
+            "marker": "o",
+            "linestyle": "-",
+        },
+        "Target + noise": {
+            "color": "#ff7f0e",
+            "marker": "s",
+            "linestyle": "--",
+        },
+        "Interference + mismatch": {
+            "color": "#2ca02c",
+            "marker": "^",
+            "linestyle": "-.",
+        },
+    }
+
+    for R, lb in zip(R_list, labels):
+        Rb = hermitize(R)
+        evals = torch.linalg.eigvalsh(Rb).real
+        evals = torch.flip(evals, dims=[-1])
+
+        if normalize_trace:
+            evals = evals / evals.sum().clamp_min(1e-12)
+
+        y = evals.clamp_min(1e-12)
+        if use_log:
+            y = torch.log(y)
+
+        y = y.detach().cpu().numpy()
+        x = np.arange(1, len(y) + 1)
+
+        plot_label = label_map.get(lb, lb)
+        st = style_map.get(plot_label, {})
+
+        plt.plot(
+            x,
+            y,
+            label=plot_label,
+            color=st.get("color", None),
+            marker=st.get("marker", "o"),
+            linestyle=st.get("linestyle", "-"),
+            linewidth=2.2,
+            markersize=5.8,
+            markerfacecolor=st.get("color", None),
+            markeredgecolor="white",
+            markeredgewidth=0.8,
+        )
+
+    ax = plt.gca()
+
+    plt.xlabel("Eigenvalue index (descending)")
+    if use_log and normalize_trace:
+        plt.ylabel(r"$\log(\lambda_i)$, trace-normalized")
+    elif use_log:
+        plt.ylabel(r"$\log(\lambda_i)$")
+    else:
+        plt.ylabel(r"$\lambda_i$")
+
+    ax.set_xlim(0.8, len(R_list[0]) + 0.2 if hasattr(R_list[0], "__len__") else 10.2)
+    ax.set_ylim(-6.2, -0.3)
+
+    apply_axis_style(ax)
+
+    leg = ax.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.35),
+        ncol=3,
+        frameon=True,
+        fancybox=False,
+        fontsize=9,
+        columnspacing=1.0,
+        handlelength=2.2,
+        handletextpad=0.5,
+        borderpad=0.45,
+    )
+    leg.get_frame().set_linewidth(0.8)
+    leg.get_frame().set_alpha(0.95)
+
+    plt.subplots_adjust(bottom=0.30)
+    savefig_dual(out_base)
+    plt.close()
+
+@torch.no_grad()
+def plot_beampattern_annotated(cfg: SimCfg, device,
+                               weights_dict: Dict[str, torch.Tensor],
+                               out_base: str):
+    """
+    Beampattern (normalized), annotate SOI & interferers using vertical dashed lines.
+    """
+    set_pub_style()
+    thetas = torch.linspace(-90.0, 90.0, 721, device=device)
+    A = steering_ula(cfg.N, cfg.d_over_lambda, thetas, device=device)
+
+    plt.figure(figsize=(6.8, 4.4))
+    for name, w in weights_dict.items():
+        resp = torch.abs(A @ torch.conj(w))
+        resp_db = 20.0 * torch.log10((resp / resp.max()).clamp_min(1e-8))
+        if name == "Proposed TM-DRO":
+            plt.plot(thetas.cpu().numpy(), resp_db.cpu().numpy(), label=name, linewidth=2.6)
+        elif name == "Optimal SINR":
+            plt.plot(thetas.cpu().numpy(), resp_db.cpu().numpy(), label=name, linewidth=2.3)
+        else:
+            plt.plot(thetas.cpu().numpy(), resp_db.cpu().numpy(), label=name, linewidth=1.9)
+
+    # key angles
+    plt.axvline(cfg.theta_s_nom_deg, linestyle="--", linewidth=1.8)
+    for th in cfg.theta_js_deg:
+        plt.axvline(th, linestyle="--", linewidth=1.8)
+
+    plt.ylim([-80, 5])
+    plt.xlabel("Angle (deg)")
+    plt.ylabel("Normalized beampattern (dB)")
+    ax = plt.gca()
+    apply_axis_style(ax)
+    legend_outside_bottom(ax, max_cols=3)
+    savefig_dual(out_base)
+    plt.close()
+
+
+@torch.no_grad()
+def make_revision_beampattern_fig(
+    cfg: SimCfg,
+    device,
+    out_dir: str,
+    models: Dict[str, nn.Module],
+    L: int,
+    snr_db: float = 10.0,
+    mc_for_scene: int = 1,
+    array_type: str = "ula",
+    error_type: str = "angle",
+):
+    """
+    Draw normalized beampatterns for the same set of methods under a given L.
+    The figure is saved as:
+      fig_beampattern_L{L}.pdf
+      fig_beampattern_L{L}.png
+    """
+    batch = gen_scene_batch_revision(
+        cfg,
+        B=mc_for_scene,
+        L=L,
+        snr_db=snr_db,
+        device=device,
+        array_type=array_type,
+        error_type=error_type,
+    )
+
+    weights_dict = {}
+
+    # Oracle
+    w_oracle = mvdr_weight(batch["Rin_true"], batch["a_true"])[0]
+    weights_dict["Oracle"] = w_oracle
+
+    # Classical and reconstruction baselines
+    weights_dict["SMI MVDR"] = mvdr_weight(batch["Rhat"], batch["a_nom"])[0]
+
+    weights_dict["LSMI"] = lsmi_weight(
+        batch["Rhat"], batch["a_nom"], beta=0.1
+    )[0]
+
+    weights_dict["OAS-Shrinkage"] = oas_shrinkage_mvdr_weight(
+        batch["Rhat"], batch["a_nom"], L=L
+    )[0]
+
+    weights_dict["RCB"] = rcb_weight(
+        batch["Rhat"], batch["a_nom"], eps=0.15
+    )[0]
+
+    weights_dict["CMR-Capon"] = cmr_capon_weight(
+        batch["Rhat"],
+        batch["a_nom"],
+        batch["pos_nom"],
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        exclude_deg=10.0,
+        grid_step_deg=2.0,
+        rho=1e-3,
+    )[0]
+
+    weights_dict["MEPS-IPNC (SPL2020)"] = meps_ipnc_weight(
+        batch["Rhat"],
+        batch["a_nom"],
+        batch["pos_nom"],
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        soi_sector_deg=6.0,
+        grid_i_step_deg=2.0,
+        grid_s_step_deg=1.0,
+        rho=1e-3,
+        estimate_sv=True,
+    )[0]
+
+    weights_dict["PGLQ-INCM (SP2026)"] = pglq_incm_weight(
+        batch["Rhat"],
+        batch["a_nom"],
+        batch["pos_nom"],
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        exclude_deg=6.0,
+        Q=3,
+        null_width_u=None,
+        signal_subspace_dim=4,
+        peak_gain=3.0,
+        rho=1e-3,
+    )[0]
+
+    weights_dict["IPN-UDL (TSP2025)"] = ipn_udl_weight(
+        batch["Rhat"],
+        batch["a_nom"],
+        pos_nom=batch["pos_nom"],
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        d_over_lambda=cfg.d_over_lambda,
+        soi_exclude_deg=10.0,
+        grid_step_deg=2.0,
+        K_udl=3,
+    )[0]
+
+    weights_dict["IRDRCB-Krylov (Sensors2024)"] = irdrcb_krylov_weight(
+        batch["Rhat"],
+        batch["a_nom"],
+        rank=min(6, cfg.N),
+        norm_bound=10.0,
+    )[0]
+
+    # Slow CVXPY baselines, only B=1 here, so acceptable
+    try:
+        weights_dict["Irani DRO (TSP2025)"] = irani_dro_weight(
+            batch["Rhat"],
+            batch["a_nom"],
+            max_iter=0,
+        )[0]
+    except Exception as e:
+        print(f"[Warning] Irani DRO beampattern failed: {e}")
+
+    try:
+        weights_dict["WC-QMI-A1-LMI (TSP2023)"] = wc_qmi_a1_lmi_weight(
+            batch["Rhat"],
+            batch["a_nom"],
+            solver="SCS",
+            verbose=False,
+            max_iters=500,
+            eps=1e-3,
+        )[0]
+    except Exception as e:
+        print(f"[Warning] WC-QMI-A1-LMI beampattern failed: {e}")
+
+    # Deep-learning baselines and proposed model
+    for name, mdl in models.items():
+        mdl.eval()
+
+        cls_name = mdl.__class__.__name__
+        if cls_name in ["BlackBoxEigenMLP", "CVCNNBeamformer", "GRURNNBeamformer"]:
+            w = mdl(batch["Rhat"], batch["a_nom"])[0]
+        else:
+            out = mdl(batch["Rhat"])
+            w = robust_beamformer_from_params(
+                batch["Rhat"],
+                batch["bar_a"],
+                out["tau"],
+                out["rho"],
+                out["lam_diag"],
+            )[0]
+
+        weights_dict[name] = w
+
+    # Angular response
+    set_pub_style()
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+    thetas = torch.linspace(-90.0, 90.0, 721, device=device)
+    A = steering_from_positions(
+        batch["pos_nom"],
+        thetas,
+        device,
+        dtype=torch.complex64,
+    )
+
+    for name, w in sort_curve_items(weights_dict):
+        st = get_method_style(name)
+
+        resp = torch.abs(A @ torch.conj(w))
+        resp_db = 20.0 * torch.log10((resp / resp.max()).clamp_min(1e-8))
+
+        ax.plot(
+            thetas.detach().cpu().numpy(),
+            resp_db.detach().cpu().numpy(),
+            label=name,
+            color=st["color"],
+            linestyle=get_beampattern_linestyle(name),
+            linewidth=st["linewidth"],
+            dash_capstyle="butt",
+            solid_capstyle="round",
+        )
+
+    # SOI and interferers
+    ax.axvline(
+        cfg.theta_s_nom_deg,
+        color="#222222",
+        linestyle="--",
+        linewidth=1.4,
+        alpha=0.9,
+    )
+    ax.text(
+        cfg.theta_s_nom_deg + 1.0,
+        -6,
+        "SOI",
+        fontsize=8,
+        color="#222222",
+        rotation=90,
+        va="top",
+    )
+
+    for th in cfg.theta_js_deg:
+        ax.axvline(
+            th,
+            color="#777777",
+            linestyle=":",
+            linewidth=1.25,
+            alpha=0.9,
+        )
+
+    ax.set_xlabel("Angle (deg)")
+    ax.set_ylabel("Normalized beampattern (dB)")
+    ax.set_xlim([-90, 90])
+    ax.set_ylim([-80, 5])
+
+    apply_axis_style(ax)
+
+    legend_handles = []
+    legend_labels = []
+
+    for name, _ in sort_curve_items(weights_dict):
+        st = get_method_style(name)
+        lw = 3.0 if canonical_method_name(name) == "Proposed TM-DRO" else st["linewidth"]
+
+        legend_handles.append(
+            Line2D(
+                [0], [0],
+                color=st["color"],
+                linestyle=get_beampattern_linestyle(name),
+                linewidth=lw,
+                dash_capstyle="butt",
+                solid_capstyle="round",
+            )
+        )
+        legend_labels.append(name)
+
+    leg = ax.legend(
+        legend_handles,
+        legend_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.23),
+        ncol=4,
+        frameon=True,
+        fancybox=False,
+        fontsize=7.2,
+        handlelength=4.2,
+        columnspacing=1.0,
+        handletextpad=0.45,
+        borderaxespad=0.0,
+    )
+    leg.get_frame().set_linewidth(0.7)
+    leg.get_frame().set_alpha(0.96)
+
+    fig.subplots_adjust(bottom=0.34)
+
+    out_base = os.path.join(out_dir, f"fig_beampattern_L{L}")
+    savefig_dual(out_base)
+    plt.close(fig)
+
+def plot_snapshot_sensitivity(curves: Dict[str, Dict[float, List[float]]],
+                              L_list: List[int], snr_list: List[float],
+                              title: str, out_base: str):
+    set_pub_style()
+    plt.figure(figsize=(6.9, 4.5))
+
+    for m in curves.keys():
+        for snr in snr_list:
+            y = curves[m][snr]
+            lbl = f"{m} @ SNR={snr} dB"
+            if m == "Proposed TM-DRO":
+                plt.plot(L_list, y, label=lbl, linewidth=2.5, marker="o")
+            else:
+                plt.plot(L_list, y, label=lbl, linewidth=1.9)
+
+    plt.xscale("log")
+    plt.xlabel("Snapshots $L$ (log scale)")
+    plt.ylabel("Output SINR (dB)")
+    ax = plt.gca()
+    apply_axis_style(ax)
+    legend_outside_bottom(ax, max_cols=3)
+    savefig_dual(out_base)
+    plt.close()
+
+
+def plot_heatmap(Z: np.ndarray, x_ticks: List[float], y_ticks: List[float],
+                 title: str, xlabel: str, ylabel: str, cbar_label: str,
+                 out_base: str):
+    set_pub_style()
+    plt.figure(figsize=(6.9, 4.6))
+    im = plt.imshow(Z, aspect="auto", origin="lower")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.xticks(np.arange(len(x_ticks)), [str(x) for x in x_ticks])
+    plt.yticks(np.arange(len(y_ticks)), [str(y) for y in y_ticks])
+    cbar = plt.colorbar(im)
+    cbar.set_label(cbar_label)
+    plt.savefig(out_base + ".pdf")
+    plt.savefig(out_base + ".png", dpi=450)
+    plt.close()
+
+
+# =========================================================
+# PCA (SVD) + plotting + saving embeddings
+# =========================================================
+def pca_2d(X: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    PCA to 2D using SVD (no sklearn dependency).
+    Returns:
+      Z: [M,2] PCA coords
+      mean: [D]
+      V2: [2,D] principal axes
+    """
+    X = np.asarray(X, dtype=np.float64)
+    mean = X.mean(axis=0, keepdims=True)
+    Xc = X - mean
+    _, _, Vt = np.linalg.svd(Xc, full_matrices=False)
+    V2 = Vt[:2, :]
+    Z = Xc @ V2.T
+    return Z, mean.squeeze(0), V2
+
+
+def plot_embedding_pca(emb: np.ndarray, labels: List[str], title: str, out_base: str):
+    set_pub_style()
+    Z, _, _ = pca_2d(emb)
+
+    plt.figure(figsize=(6.8, 4.4))
+    uniq = sorted(list(set(labels)))
+    for lb in uniq:
+        idx = [i for i, x in enumerate(labels) if x == lb]
+        plt.scatter(Z[idx, 0], Z[idx, 1], s=26, label=lb, alpha=0.85)
+
+    plt.xlabel("PCA-1")
+    plt.ylabel("PCA-2")
+    ax = plt.gca()
+    apply_axis_style(ax)
+    legend_outside_bottom(ax, max_cols=3)
+    savefig_dual(out_base)
+    plt.close()
+
+    return Z
+
+
+# =========================================================
+# Figure pipelines
+# =========================================================
+@torch.no_grad()
+def make_cov_and_spectrum_figs(cfg: SimCfg, device, out_dir: str, L: int, snr_db: float):
+    # Case A: noise dominated
+    bA = gen_scene_custom(cfg, 1, L, snr_db=-30.0, device=device, inr_db=-30.0, mismatch_std_deg=0.0)
+    # Case B: target + noise
+    bB = gen_scene_custom(cfg, 1, L, snr_db=snr_db, device=device, inr_db=-30.0, mismatch_std_deg=0.0)
+    # Case C: target + interference + mismatch
+    bC = gen_scene_custom(cfg, 1, L, snr_db=snr_db, device=device,
+                          inr_db=cfg.INR_dB, mismatch_std_deg=cfg.mismatch_std_deg)
+
+    R_A, R_B, R_C = bA["Rhat"][0], bB["Rhat"][0], bC["Rhat"][0]
+
+    plot_cov_heatmaps(
+        [R_A, R_B, R_C],
+        [f"Case A: noise-dom (L={L})",
+         f"Case B: target+noise (SNR={snr_db} dB, L={L})",
+         f"Case C: +interf+mismatch (INR={cfg.INR_dB} dB, L={L})"],
+        os.path.join(out_dir, "fig_cov_heatmaps_3cases")
+    )
+
+    plot_eigenspectra(
+        [R_A, R_B, R_C],
+        ["Case A: noise-dom", "Case B: target+noise", "Case C: +interf+mismatch"],
+        os.path.join(out_dir, "fig_eigspectra_3cases"),
+        use_log=True, normalize_trace=True
+    )
+
+    # Export spectra values to CSV
+    rows = []
+    for tag, R in [("A_noise", R_A), ("B_target", R_B), ("C_interf_mis", R_C)]:
+        evals = torch.linalg.eigvalsh(hermitize(R)).real
+        evals = torch.flip(evals, dims=[-1])
+        evals = (evals / evals.sum().clamp_min(1e-12)).detach().cpu().numpy()
+        for i, v in enumerate(evals, start=1):
+            rows.append([tag, i, float(v)])
+    write_csv(os.path.join(out_dir, "data_eigspectra_3cases.csv"),
+              ["case", "eig_idx", "eig_trace_norm"], rows)
+
+
+@torch.no_grad()
+def make_sinr_vs_snr_figs(cfg: SimCfg, device, out_dir: str,
+                          models_for_plot: Dict[str, nn.Module],
+                          snr_list: List[float],
+                          L: int, mc_runs: int,
+                          dl_rho_fixed: float = 0.1,
+                          fig_name: str = "fig_sinr_vs_snr",
+                          export_prefix: str = "data_sinr_vs_snr"):
+    curves_mean = {k: [] for k in (["Optimal SINR"] + list(models_for_plot.keys()) +
+                                   [f"DL-MVDR(rho={dl_rho_fixed})",
+                                    "SMI MVDR", "LSMI", "RCB", "Subspace MVDR", "Shrinkage-MVDR", "RVO-LCMV",
+                                    "IPN-UDL (TSP2025)",
+                                    "IRDRCB-Krylov (Sensors2024)",
+                                    "WC-QMI-A1-LMI (TSP2023)"])}
+
+    cat_curves = {k: [] for k in curves_mean.keys()}
+
+    for snr in snr_list:
+        res = eval_methods_once(cfg, device, snr, L, mc_runs, models_for_plot, dl_rho_fixed=dl_rho_fixed)
+        for k in curves_mean.keys():
+            if k in res:
+                curves_mean[k].append(float(np.mean(res[k])))
+                cat_curves[k].append(catastrophic_rate(res[k], thr_db=-5.0))
+
+    # Plot
+    plot_sinr_vs_snr_curves(curves_mean, snr_list,
+                            title=f"Output SINR vs SNR (snapshots={L})",
+                            out_base=os.path.join(out_dir, f"{fig_name}_L{L}"))
+
+    plot_catastrophic_vs_snr(cat_curves, snr_list,
+                             title=f"Catastrophic rate vs SNR (snapshots={L}, thr=-5 dB)",
+                             out_base=os.path.join(out_dir, f"fig_cat_rate_L{L}"))
+
+    # Export curves
+    header = ["snr_db"] + list(curves_mean.keys())
+    rows = []
+    for i, snr in enumerate(snr_list):
+        row = [snr]
+        for k in curves_mean.keys():
+            row.append(curves_mean[k][i])
+        rows.append(row)
+    write_csv(os.path.join(out_dir, f"{export_prefix}_L{L}.csv"), header, rows)
+
+    header2 = ["snr_db"] + list(cat_curves.keys())
+    rows2 = []
+    for i, snr in enumerate(snr_list):
+        row = [snr]
+        for k in cat_curves.keys():
+            row.append(cat_curves[k][i])
+        rows2.append(row)
+    write_csv(os.path.join(out_dir, f"data_cat_rate_L{L}.csv"), header2, rows2)
+
+    return curves_mean, cat_curves
+
+
+@torch.no_grad()
+def make_ablation_fig(cfg: SimCfg, device, out_dir: str,
+                      ablation_models: Dict[str, nn.Module],
+                      snr_list: List[float], L: int, mc_runs: int):
+    curves = {k: [] for k in ["Optimal SINR"] + list(ablation_models.keys()) + ["SMI MVDR"]}
+    for snr in snr_list:
+        res = eval_methods_once(cfg, device, snr, L, mc_runs, ablation_models, dl_rho_fixed=0.1)
+        for k in curves.keys():
+            if k in res:
+                curves[k].append(float(np.mean(res[k])))
+
+    plot_sinr_vs_snr_curves(curves, snr_list,
+                            title=f"Ablation: SINR vs SNR (snapshots={L})",
+                            out_base=os.path.join(out_dir, f"fig_ablation_L{L}"))
+
+    header = ["snr_db"] + list(curves.keys())
+    rows = []
+    for i, snr in enumerate(snr_list):
+        rows.append([snr] + [curves[k][i] for k in curves.keys()])
+    write_csv(os.path.join(out_dir, f"data_ablation_L{L}.csv"), header, rows)
+
+
+@torch.no_grad()
+def make_robustness_phase_diagram(cfg: SimCfg, device, out_dir: str,
+                                  proposed_model: nn.Module,
+                                  snr_list: List[float],
+                                  mismatch_list: List[float],
+                                  L: int, mc_runs: int):
+    """
+    Heatmaps:
+      - ΔSINR(Proposed - SMI) in dB
+      - ΔCatRate(SMI - Proposed) in percentage points (positive is better)
+    """
+    Z_sinr = np.zeros((len(mismatch_list), len(snr_list)), dtype=np.float64)
+    Z_cat = np.zeros_like(Z_sinr)
+
+    for i, mis in enumerate(mismatch_list):
+        for j, snr in enumerate(snr_list):
+            batch = gen_scene_custom(cfg, B=mc_runs, L=L, snr_db=snr, device=device,
+                                     inr_db=cfg.INR_dB, mismatch_std_deg=mis)
+
+            # SMI
+            w_smi = mvdr_weight(batch["Rhat"], batch["a_nom"])
+            sinr_smi = sinr_out_db(w_smi, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+            cat_smi = catastrophic_rate(sinr_smi, thr_db=-5.0)
+
+            # Proposed
+            out = proposed_model(batch["Rhat"])
+            w_p = robust_beamformer_from_params(batch["Rhat"], batch["bar_a"], out["tau"], out["rho"], out["lam_diag"])
+            sinr_p = sinr_out_db(w_p, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+            cat_p = catastrophic_rate(sinr_p, thr_db=-5.0)
+
+            Z_sinr[i, j] = float(np.mean(sinr_p) - np.mean(sinr_smi))
+            Z_cat[i, j] = float(cat_smi - cat_p)
+
+    plot_heatmap(Z_sinr, snr_list, mismatch_list,
+                 title=f"Robustness map: ΔSINR(Proposed−SMI), L={L}",
+                 xlabel="SNR (dB)", ylabel="Mismatch std (deg)",
+                 cbar_label="ΔSINR (dB)",
+                 out_base=os.path.join(out_dir, "fig_phase_delta_sinr"))
+
+    plot_heatmap(Z_cat, snr_list, mismatch_list,
+                 title=f"Robustness map: ΔCatRate(SMI−Proposed), L={L}, thr=-5 dB",
+                 xlabel="SNR (dB)", ylabel="Mismatch std (deg)",
+                 cbar_label="ΔCatRate (percentage points)",
+                 out_base=os.path.join(out_dir, "fig_phase_delta_catrate"))
+
+    # Export heatmaps
+    rows_sinr = []
+    for i, mis in enumerate(mismatch_list):
+        for j, snr in enumerate(snr_list):
+            rows_sinr.append([mis, snr, float(Z_sinr[i, j])])
+    write_csv(os.path.join(out_dir, "data_phase_delta_sinr.csv"),
+              ["mismatch_deg", "snr_db", "delta_sinr_db"], rows_sinr)
+
+    rows_cat = []
+    for i, mis in enumerate(mismatch_list):
+        for j, snr in enumerate(snr_list):
+            rows_cat.append([mis, snr, float(Z_cat[i, j])])
+    write_csv(os.path.join(out_dir, "data_phase_delta_catrate.csv"),
+              ["mismatch_deg", "snr_db", "delta_catrate_pp"], rows_cat)
+
+
+@torch.no_grad()
+def make_snapshot_sensitivity(cfg: SimCfg, device, out_dir: str,
+                              proposed_model: nn.Module,
+                              L_list: List[int],
+                              snr_list: List[float],
+                              mc_runs: int):
+    """
+    Compare Proposed vs SMI across L.
+    """
+    curves = {"Proposed TM-DRO": {snr: [] for snr in snr_list},
+              "SMI MVDR": {snr: [] for snr in snr_list}}
+
+    for L in L_list:
+        for snr in snr_list:
+            batch = gen_scene_custom(cfg, B=mc_runs, L=L, snr_db=snr, device=device,
+                                     inr_db=cfg.INR_dB, mismatch_std_deg=cfg.mismatch_std_deg)
+            # SMI
+            w_smi = mvdr_weight(batch["Rhat"], batch["a_nom"])
+            sinr_smi = sinr_out_db(w_smi, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).mean().item()
+
+            # Proposed
+            out = proposed_model(batch["Rhat"])
+            w_p = robust_beamformer_from_params(batch["Rhat"], batch["bar_a"], out["tau"], out["rho"], out["lam_diag"])
+            sinr_p = sinr_out_db(w_p, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).mean().item()
+
+            curves["Proposed TM-DRO"][snr].append(float(sinr_p))
+            curves["SMI MVDR"][snr].append(float(sinr_smi))
+
+    plot_snapshot_sensitivity(curves, L_list, snr_list,
+                              title="Snapshot sensitivity: SINR vs L",
+                              out_base=os.path.join(out_dir, "fig_sinr_vs_L"))
+
+    # Export
+    header = ["L", "snr_db", "method", "mean_sinr_db"]
+    rows = []
+    for L_idx, L in enumerate(L_list):
+        for snr in snr_list:
+            rows.append([L, snr, "Proposed TM-DRO", curves["Proposed TM-DRO"][snr][L_idx]])
+            rows.append([L, snr, "SMI MVDR", curves["SMI MVDR"][snr][L_idx]])
+    write_csv(os.path.join(out_dir, "data_sinr_vs_L.csv"), header, rows)
+
+
+@torch.no_grad()
+def make_embedding_pca_fig(cfg: SimCfg, device, out_dir: str,
+                           model: nn.Module,
+                           L: int, snr_db: float,
+                           n_per_class: int = 60):
+    """
+    Classes:
+      - Noise-dom
+      - Target+Noise
+      - Strong Interf
+      - Mismatch Heavy
+    """
+    model.eval()
+    classes = [
+        ("Noise-dom", dict(snr_db=-30.0, inr_db=-30.0, mismatch=0.0)),
+        ("Target+Noise", dict(snr_db=snr_db, inr_db=-30.0, mismatch=0.0)),
+        ("Strong Interf", dict(snr_db=snr_db, inr_db=cfg.INR_dB, mismatch=0.0)),
+        ("Mismatch Heavy", dict(snr_db=snr_db, inr_db=cfg.INR_dB, mismatch=max(4.0, cfg.mismatch_std_deg * 2))),
+    ]
+
+    embs = []
+    lbs = []
+    for cname, params in classes:
+        batch = gen_scene_custom(cfg, B=n_per_class, L=L, snr_db=params["snr_db"], device=device,
+                                 inr_db=params["inr_db"], mismatch_std_deg=params["mismatch"])
+        out = model(batch["Rhat"])
+        g = out["embed"].detach().cpu().numpy()
+        embs.append(g)
+        lbs += [cname] * g.shape[0]
+
+    emb = np.concatenate(embs, axis=0)
+
+    # Export raw embeddings
+    rows = []
+    for i in range(emb.shape[0]):
+        rows.append([lbs[i]] + [float(x) for x in emb[i].tolist()])
+    write_csv(os.path.join(out_dir, "data_embeddings.csv"),
+              ["label"] + [f"dim{i+1}" for i in range(emb.shape[1])], rows)
+
+    # PCA and plot
+    Z = plot_embedding_pca(emb, lbs, title="Scene embeddings (PCA) from eigen-spectrum tokens",
+                           out_base=os.path.join(out_dir, "fig_embedding_pca"))
+
+    # Export PCA coords
+    rows2 = []
+    for i in range(Z.shape[0]):
+        rows2.append([lbs[i], float(Z[i, 0]), float(Z[i, 1])])
+    write_csv(os.path.join(out_dir, "data_embeddings_pca2d.csv"),
+              ["label", "pca1", "pca2"], rows2)
+
+
+# =========================================================
+# Paper tables
+# =========================================================
+@torch.no_grad()
+def make_paper_tables(cfg: SimCfg, device, out_dir: str,
+                      models_main: Dict[str, nn.Module],
+                      L_list: List[int],
+                      snr_db: float = 10.0,
+                      mc_runs: int = 600,
+                      dl_rho_fixed: float = 0.1,
+                      outage_thr_db: float = -5.0):
+    """
+    Table 1: mean/median SINR at SNR=10 dB for L in L_list
+    Table 2: (loss gap to optimal) + (outage rate) combined
+    """
+    methods = ["Optimal SINR"] + list(models_main.keys()) + [
+        "IPN-UDL (TSP2025)",
+        "IRDRCB-Krylov (Sensors2024)",
+        "WC-QMI-A1-LMI (TSP2023)",
+        "Shrinkage-MVDR", "LSMI", "RCB", "RVO-LCMV",
+        f"DL-MVDR(rho={dl_rho_fixed})", "SMI MVDR", "Subspace MVDR"
+    ]
+    stats = {L: {} for L in L_list}
+    for L in L_list:
+        res = eval_methods_once(cfg, device, snr_db, L, mc_runs, models_main, dl_rho_fixed=dl_rho_fixed)
+        for m in methods:
+            if m in res:
+                x = np.asarray(res[m]).reshape(-1)
+                stats[L][m] = {
+                    "mean": float(np.mean(x)),
+                    "median": float(np.median(x)),
+                    "outage": float(np.mean(x < outage_thr_db) * 100.0)
+                }
+
+    # ---------- Table 1 (mean/median) ----------
+    rows_csv = []
+    for m in methods:
+        row = [m]
+        for L in L_list:
+            row += [f"{stats[L][m]['mean']:.2f}", f"{stats[L][m]['median']:.2f}"]
+        rows_csv.append(row)
+
+    header = ["Method"]
+    for L in L_list:
+        header += [f"Mean@L{L}", f"Median@L{L}"]
+    write_csv(os.path.join(out_dir, "table_sinr_mean_median.csv"), header, rows_csv)
+
+    # LaTeX
+    header_lines = []
+    if len(L_list) == 2:
+        L1, L2 = L_list
+        header_lines.append(f"& \\multicolumn{{2}}{{c}}{{Snapshots = {L1}}} & \\multicolumn{{2}}{{c}}{{Snapshots = {L2}}} \\\\")
+        header_lines.append("\\cmidrule(lr){2-3}\\cmidrule(lr){4-5}")
+        header_lines.append("Method & Mean SINR & Median SINR & Mean SINR & Median SINR \\\\")
+        colspec = "lcccc"
+        body_lines = []
+        for m in methods:
+            body_lines.append(
+                f"{m} & {stats[L1][m]['mean']:.2f} & {stats[L1][m]['median']:.2f} & {stats[L2][m]['mean']:.2f} & {stats[L2][m]['median']:.2f} \\\\"
+            )
+        write_tex_table(
+            os.path.join(out_dir, "table_sinr_mean_median.tex"),
+            caption=f"Mean and median output SINR (dB) at $\\mathrm{{SNR}}={snr_db}$~dB under steering mismatch.",
+            label="tab:sinr_mean_median",
+            colspec=colspec,
+            header_lines=header_lines,
+            body_lines=body_lines,
+            notes=f"Averaged over {mc_runs} Monte Carlo trials. "
+                  f"$\\theta_s^{{\\mathrm{{true}}}}=\\theta_s^{{\\mathrm{{nom}}}}+\\mathcal{{N}}(0,\\sigma_\\theta^2)$ "
+                  f"with $\\sigma_\\theta={cfg.mismatch_std_deg}^\\circ$."
+        )
+    else:
+        colspec = "l" + "c" * (2 * len(L_list))
+        header_lines.append("Method " + " & ".join([f"& Mean@{L} & Median@{L}" for L in L_list]) + " \\\\")
+        body_lines = []
+        for m in methods:
+            vals = []
+            for L in L_list:
+                vals += [f"{stats[L][m]['mean']:.2f}", f"{stats[L][m]['median']:.2f}"]
+            body_lines.append(m + " & " + " & ".join(vals) + " \\\\")
+        write_tex_table(
+            os.path.join(out_dir, "table_sinr_mean_median.tex"),
+            caption=f"Mean and median output SINR (dB) at $\\mathrm{{SNR}}={snr_db}$~dB under steering mismatch.",
+            label="tab:sinr_mean_median",
+            colspec=colspec,
+            header_lines=header_lines,
+            body_lines=body_lines
+        )
+
+    # ---------- Table 2: loss gap + outage ----------
+    rows2 = []
+    for m in methods:
+        row = [m]
+        for L in L_list:
+            opt_mean = stats[L]["Optimal SINR"]["mean"]
+            gap = opt_mean - stats[L][m]["mean"]
+            outage = stats[L][m]["outage"]
+            row += [f"{gap:.2f}", f"{outage:.2f}"]
+        rows2.append(row)
+
+    header2 = ["Method"]
+    for L in L_list:
+        header2 += [f"LossGap@L{L}", f"Outage%(<{outage_thr_db}dB)@L{L}"]
+    write_csv(os.path.join(out_dir, "table_loss_outage.csv"), header2, rows2)
+
+    if len(L_list) == 2:
+        L1, L2 = L_list
+        header_lines2 = []
+        header_lines2.append(f"& \\multicolumn{{2}}{{c}}{{Snapshots = {L1}}} & \\multicolumn{{2}}{{c}}{{Snapshots = {L2}}} \\\\")
+        header_lines2.append("\\cmidrule(lr){2-3}\\cmidrule(lr){4-5}")
+        header_lines2.append(f"Method & Loss gap & Outage (\\%) & Loss gap & Outage (\\%) \\\\")
+        colspec2 = "lcccc"
+        body2 = []
+        for m in methods:
+            opt1 = stats[L1]["Optimal SINR"]["mean"]
+            opt2 = stats[L2]["Optimal SINR"]["mean"]
+            gap1 = opt1 - stats[L1][m]["mean"]
+            gap2 = opt2 - stats[L2][m]["mean"]
+            out1 = stats[L1][m]["outage"]
+            out2 = stats[L2][m]["outage"]
+            body2.append(f"{m} & {gap1:.2f} & {out1:.2f} & {gap2:.2f} & {out2:.2f} \\\\")
+        write_tex_table(
+            os.path.join(out_dir, "table_loss_outage.tex"),
+            caption=f"Combined robustness indicators at $\\mathrm{{SNR}}={snr_db}$~dB: "
+                    f"loss gap to optimal mean SINR (dB) and outage rate (\\%) below {outage_thr_db}~dB.",
+            label="tab:loss_outage",
+            colspec=colspec2,
+            header_lines=header_lines2,
+            body_lines=body2,
+            notes=f"Outage threshold: {outage_thr_db} dB. Averaged over {mc_runs} Monte Carlo trials."
+        )
+
+# =========================================================
+# Revision Add-on for reviewers: extra experiments + fixed mapping
+# Paste this block BEFORE def main()
+# =========================================================
+
+import time
+
+
+# ---------------------------------------------------------
+# 0) Replace the original robust_beamformer_from_params
+# ---------------------------------------------------------
+def robust_beamformer_from_params(Rhat, bar_a, tau, rho, lam_diag, eps_max: float = 0.25) -> torch.Tensor:
+    """
+    Revised robust mapping.
+
+    Why this replacement is necessary:
+    The old mapping used w = alpha * v, where tau and Lambda mainly changed alpha.
+    Output SINR is scale-invariant to alpha, so tau and Lambda had almost no effect on SINR.
+    Here tau and Lambda perturb the robust steering vector itself:
+        R_rho = Rhat + rho I
+        v = R_rho^{-1} bar_a
+        d = normalize(v / sqrt(lambda))
+        a_rob = normalize(bar_a - eta(tau) d)
+        w = MVDR(R_rho, a_rob)
+
+    Therefore tau and Lambda affect the beampattern and the output SINR.
+    """
+    B, N, _ = Rhat.shape
+    dtype = Rhat.dtype
+    I = cplx_eye(N, Rhat.device, dtype=dtype)[None].expand(B, -1, -1)
+
+    Rrho = Rhat + rho[:, None, None].to(dtype) * I
+    v = solve(Rrho, bar_a)
+
+    d = v / torch.sqrt(lam_diag.clamp_min(1e-6)).to(dtype)
+    d = d / torch.linalg.norm(d, dim=-1, keepdim=True).clamp_min(1e-12)
+
+    eta = eps_max * (tau / (1.0 + tau)).clamp(0.0, 1.0)
+    a_rob = bar_a - eta[:, None].to(dtype) * d
+    a_rob = a_rob / torch.linalg.norm(a_rob, dim=-1, keepdim=True).clamp_min(1e-12)
+
+    return mvdr_weight(Rrho, a_rob)
+
+
+def robust_beamformer_scaling_only_old(Rhat, bar_a, tau, rho, lam_diag) -> torch.Tensor:
+    """
+    Old diagnostic-only version:
+    tau and Lambda only enter alpha, so output SINR should be invariant.
+    Keep this only for the reviewer diagnostic table.
+    """
+    B, N, _ = Rhat.shape
+    dtype = Rhat.dtype
+    I = cplx_eye(N, Rhat.device, dtype=dtype)[None].expand(B, -1, -1)
+
+    Rl = Rhat + rho[:, None, None].to(dtype) * I
+    v = solve(Rl, bar_a)
+
+    vhb = (torch.conj(v) * bar_a).sum(dim=-1).real
+    inv_lam = 1.0 / lam_diag.clamp_min(1e-6)
+    maha = torch.sqrt((abs2(v) * inv_lam).sum(dim=-1).clamp_min(1e-12))
+    denom = F.softplus(vhb - tau * maha) + 1e-6
+    alpha = 1.0 / denom
+    return v * alpha[:, None].to(dtype)
+
+
+# ---------------------------------------------------------
+# 1) Generic array geometry: ULA, UCA, CCAA
+# ---------------------------------------------------------
+def array_positions_2d(N: int, d_over_lambda: float, array_type: str, device) -> torch.Tensor:
+    """
+    Return 2D sensor positions in wavelength units, shape [N, 2].
+    array_type: "ula", "uca", or "ccaa".
+    """
+    array_type = array_type.lower()
+
+    if array_type == "ula":
+        x = (torch.arange(N, device=device, dtype=torch.float32) - (N - 1) / 2.0) * d_over_lambda
+        y = torch.zeros_like(x)
+        return torch.stack([x, y], dim=-1)
+
+    if array_type == "uca":
+        radius = max(d_over_lambda, N * d_over_lambda / (2.0 * math.pi))
+        phi = 2.0 * math.pi * torch.arange(N, device=device, dtype=torch.float32) / N
+        x = radius * torch.cos(phi)
+        y = radius * torch.sin(phi)
+        return torch.stack([x, y], dim=-1)
+
+    if array_type == "ccaa":
+        # Simple concentric circular antenna array: inner ring + outer ring.
+        n1 = N // 2
+        n2 = N - n1
+        r1 = max(d_over_lambda, n1 * d_over_lambda / (2.0 * math.pi))
+        r2 = 1.8 * r1
+
+        phi1 = 2.0 * math.pi * torch.arange(n1, device=device, dtype=torch.float32) / max(1, n1)
+        phi2 = 2.0 * math.pi * (torch.arange(n2, device=device, dtype=torch.float32) + 0.5) / max(1, n2)
+
+        p1 = torch.stack([r1 * torch.cos(phi1), r1 * torch.sin(phi1)], dim=-1)
+        p2 = torch.stack([r2 * torch.cos(phi2), r2 * torch.sin(phi2)], dim=-1)
+        return torch.cat([p1, p2], dim=0)
+
+    raise ValueError("array_type must be 'ula', 'uca', or 'ccaa'.")
+
+
+def steering_from_positions(pos: torch.Tensor, theta_deg: torch.Tensor, device, dtype=torch.complex64) -> torch.Tensor:
+    """
+    Far-field steering vector from 2D positions.
+    theta is measured from the broadside of the ULA.
+    pos: [N, 2]
+    theta_deg: [B]
+    return: [B, N]
+    """
+    theta = theta_deg.to(device=device, dtype=torch.float32) * math.pi / 180.0
+    ux = torch.sin(theta)[:, None]
+    uy = torch.cos(theta)[:, None]
+
+    phase = 2.0 * math.pi * (ux * pos[None, :, 0] + uy * pos[None, :, 1])
+    a = torch.exp(1j * phase.to(torch.complex64))
+    a = a / torch.linalg.norm(a, dim=-1, keepdim=True).clamp_min(1e-12)
+    return a.to(dtype)
+
+
+def steering_from_batch_positions(pos_b: torch.Tensor, theta_deg: torch.Tensor, dtype=torch.complex64) -> torch.Tensor:
+    """
+    Batch-specific positions.
+    pos_b: [B, N, 2]
+    theta_deg: [B]
+    return: [B, N]
+    """
+    theta = theta_deg.to(device=pos_b.device, dtype=torch.float32) * math.pi / 180.0
+    ux = torch.sin(theta)[:, None]
+    uy = torch.cos(theta)[:, None]
+
+    phase = 2.0 * math.pi * (ux * pos_b[:, :, 0] + uy * pos_b[:, :, 1])
+    a = torch.exp(1j * phase.to(torch.complex64))
+    a = a / torch.linalg.norm(a, dim=-1, keepdim=True).clamp_min(1e-12)
+    return a.to(dtype)
+
+
+def normalize_complex_vec(a: torch.Tensor) -> torch.Tensor:
+    return a / torch.linalg.norm(a, dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def apply_gain_phase_error(a: torch.Tensor, amp: torch.Tensor, phase: torch.Tensor) -> torch.Tensor:
+    """
+    a: [B,N] or [B,N,K]
+    amp, phase: [B,N]
+    """
+    g = amp * torch.exp(1j * phase.to(torch.complex64))
+    if a.ndim == 2:
+        return normalize_complex_vec(a * g)
+    return normalize_complex_vec(a * g[:, :, None])
+
+
+def add_random_sv_error(a: torch.Tensor, eps: float) -> torch.Tensor:
+    z = sample_complex_gaussian(a.shape, a.device, dtype=a.dtype)
+    z = z / torch.linalg.norm(z, dim=-1, keepdim=True).clamp_min(1e-12)
+    return normalize_complex_vec(a + eps * z)
+
+
+# ---------------------------------------------------------
+# 2) Scene generator with non-angle errors
+# ---------------------------------------------------------
+@torch.no_grad()
+def gen_scene_batch_revision(
+    cfg: SimCfg,
+    B: int,
+    L: int,
+    snr_db,
+    device,
+    array_type: str = "ula",
+    error_type: str = "angle",
+    gain_amp_std: float = 0.08,
+    gain_phase_std_deg: float = 6.0,
+    pos_std_lambda: float = 0.03,
+    rand_sv_eps: float = 0.08,
+) -> Dict[str, torch.Tensor]:
+    """
+    error_type:
+      - "angle": DOA mismatch only
+      - "gain_phase": element gain/phase error
+      - "position": sensor position error
+      - "random_sv": random steering-vector perturbation
+      - "combined": all above
+      - "none": no mismatch
+    """
+    N = cfg.N
+    dtype = torch.complex64
+
+    if not torch.is_tensor(snr_db):
+        snr_db = torch.full((B,), float(snr_db), device=device, dtype=torch.float32)
+    else:
+        snr_db = snr_db.to(device=device, dtype=torch.float32)
+        if snr_db.numel() == 1:
+            snr_db = snr_db.expand(B)
+
+    pos_nom = array_positions_2d(N, cfg.d_over_lambda, array_type, device)
+    pos_true = pos_nom[None, :, :].expand(B, -1, -1).clone()
+
+    if error_type in ["position", "combined"]:
+        pos_true = pos_true + pos_std_lambda * torch.randn(B, N, 2, device=device)
+
+    theta_nom = torch.full((B,), float(cfg.theta_s_nom_deg), device=device, dtype=torch.float32)
+    theta_true = theta_nom.clone()
+
+    if error_type in ["angle", "combined"]:
+        theta_true = theta_true + cfg.mismatch_std_deg * torch.randn(B, device=device)
+
+    a_nom = steering_from_positions(pos_nom, theta_nom, device, dtype=dtype)
+    a_true = steering_from_batch_positions(pos_true, theta_true, dtype=dtype)
+
+    a_j_list = []
+    for th in cfg.theta_js_deg:
+        th_vec = torch.full((B,), float(th), device=device, dtype=torch.float32)
+        a_j_list.append(steering_from_batch_positions(pos_true, th_vec, dtype=dtype))
+    A_j = torch.stack(a_j_list, dim=-1)
+
+    if error_type in ["gain_phase", "combined"]:
+        amp = 1.0 + gain_amp_std * torch.randn(B, N, device=device)
+        phase = (gain_phase_std_deg * math.pi / 180.0) * torch.randn(B, N, device=device)
+        a_true = apply_gain_phase_error(a_true, amp, phase)
+        A_j = apply_gain_phase_error(A_j, amp, phase)
+
+    if error_type in ["random_sv", "combined"]:
+        a_true = add_random_sv_error(a_true, rand_sv_eps)
+
+    # bar_a is still obtained from nominal uncertainty samples.
+    M = cfg.a_samples_M
+    theta_samples = (
+        torch.tensor(cfg.theta_s_nom_deg, device=device, dtype=torch.float32)[None, None]
+        + torch.randn(B, M, device=device, dtype=torch.float32) * cfg.mismatch_std_deg
+    )
+    a_samps = steering_from_positions(pos_nom, theta_samples.reshape(-1), device, dtype=dtype).reshape(B, M, N)
+    bar_a = a_samps.mean(dim=1)
+    bar_a = bar_a / torch.linalg.norm(bar_a, dim=-1, keepdim=True).clamp_min(1e-12)
+
+    snr_lin = 10.0 ** (snr_db / 10.0)
+    sigma_s2 = snr_lin * cfg.noise_var
+    sigma_s = torch.sqrt(sigma_s2).to(torch.float32)
+
+    inr_lin = 10.0 ** (cfg.INR_dB / 10.0)
+    sigma_i2 = inr_lin * cfg.noise_var
+
+    I = cplx_eye(N, device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+    Rin_true = cfg.noise_var * I
+    for k in range(A_j.shape[-1]):
+        aj = A_j[:, :, k]
+        Rin_true = Rin_true + sigma_i2 * (aj[:, :, None] * torch.conj(aj[:, None, :]))
+    Rin_true = hermitize(Rin_true)
+
+    s = sample_complex_gaussian((B, L), device, dtype=dtype) * sigma_s[:, None].to(dtype)
+    X = a_true[:, :, None] * s[:, None, :]
+
+    for k in range(A_j.shape[-1]):
+        u = sample_complex_gaussian((B, L), device, dtype=dtype) * math.sqrt(sigma_i2)
+        X = X + A_j[:, :, k][:, :, None] * u[:, None, :]
+
+    n = sample_complex_gaussian((B, N, L), device, dtype=dtype) * math.sqrt(cfg.noise_var)
+    X = X + n
+
+    Rhat = (X @ torch.conj(X.transpose(-1, -2))) / float(L)
+    Rhat = hermitize(Rhat)
+
+    return {
+        "Rhat": Rhat,
+        "Rin_true": Rin_true,
+        "a_true": a_true,
+        "a_nom": a_nom,
+        "bar_a": bar_a,
+        "A_j": A_j,
+        "sigma_s2": sigma_s2.to(torch.float32),
+        "pos_nom": pos_nom,
+        "array_type": array_type,
+        "error_type": error_type,
+    }
+
+
+# ---------------------------------------------------------
+# 3) Additional baselines requested by reviewers
+# ---------------------------------------------------------
+def oas_shrinkage_mvdr_weight(Rhat: torch.Tensor, a: torch.Tensor, L: int = 100) -> torch.Tensor:
+    """
+    Oracle-free OAS-like shrinkage MVDR.
+    This is a stronger shrinkage baseline than a fixed-alpha shrinkage.
+    """
+    B, N, _ = Rhat.shape
+    dtype = Rhat.dtype
+    I = cplx_eye(N, Rhat.device, dtype=dtype)[None].expand(B, -1, -1)
+
+    trR = trace_batch(Rhat).real.clamp_min(1e-12)
+    mu = trR / float(N)
+    fro2 = abs2(Rhat).sum(dim=(-1, -2)).real.clamp_min(1e-12)
+
+    denom = ((L + 1.0 - 2.0 / N) * (fro2 - trR * trR / N)).clamp_min(1e-12)
+    numer = ((1.0 - 2.0 / N) * fro2 + trR * trR).clamp_min(0.0)
+    alpha = (numer / denom).clamp(0.02, 0.95)
+
+    Rsh = (1.0 - alpha[:, None, None]) * Rhat + alpha[:, None, None].to(dtype) * mu[:, None, None].to(dtype) * I
+    Rsh = hermitize(Rsh)
+    return mvdr_weight(Rsh, a)
+
+
+def cmr_capon_weight(
+    Rhat: torch.Tensor,
+    a_nom: torch.Tensor,
+    pos_nom: torch.Tensor,
+    theta_s_nom_deg: float,
+    exclude_deg: float = 10.0,
+    grid_step_deg: float = 2.0,
+    rho: float = 1e-3,
+) -> torch.Tensor:
+    """
+    Covariance Matrix Reconstruction baseline.
+    Reconstruct interference-plus-noise covariance by integrating Capon spectrum outside SOI sector.
+    """
+    B, N, _ = Rhat.shape
+    device = Rhat.device
+    dtype = Rhat.dtype
+    I = cplx_eye(N, device, dtype=dtype)[None].expand(B, -1, -1)
+    Rl = Rhat + rho * I
+
+    grid = torch.arange(-90.0, 90.0 + 1e-6, grid_step_deg, device=device)
+    mask = torch.abs(grid - float(theta_s_nom_deg)) > exclude_deg
+    grid_i = grid[mask]
+
+    A = steering_from_positions(pos_nom, grid_i, device, dtype=dtype)  # [G,N]
+    G = A.shape[0]
+
+    rhs = A.t().unsqueeze(0).expand(B, -1, -1)  # [B,N,G]
+    RinvA = torch.linalg.solve(Rl, rhs)
+    denom = (A.conj().t().unsqueeze(0) * RinvA).sum(dim=1).real.clamp_min(1e-8)  # [B,G]
+    P = 1.0 / denom
+    P = P / P.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    Rrec = torch.zeros_like(Rhat)
+    for g in range(G):
+        ag = A[g][None, :].expand(B, -1)
+        Rrec = Rrec + P[:, g][:, None, None].to(dtype) * ag[:, :, None] * ag.conj()[:, None, :]
+
+    Rrec = Rrec / float(G)
+
+    evals = torch.linalg.eigvalsh(Rhat).real
+    noise_floor = evals[:, :max(1, N // 3)].mean(dim=-1).clamp_min(1e-6)
+    Rrec = hermitize(Rrec + noise_floor[:, None, None].to(dtype) * I)
+
+    return mvdr_weight(Rrec, a_nom)
+
+
+# ---------------------------------------------------------
+# 3b) Added reconstruction baselines: MEPS-IPNC and PGLQ-INCM
+# ---------------------------------------------------------
+def _sidelobe_uniform_grid(theta_s_nom_deg: float,
+                           exclude_deg: float,
+                           step_deg: float,
+                           device) -> torch.Tensor:
+    """Uniform theta grid outside the SOI sector."""
+    left = torch.arange(-90.0, float(theta_s_nom_deg) - exclude_deg + 1e-6, step_deg, device=device)
+    right = torch.arange(float(theta_s_nom_deg) + exclude_deg, 90.0 + 1e-6, step_deg, device=device)
+    if left.numel() == 0:
+        return right
+    if right.numel() == 0:
+        return left
+    return torch.cat([left, right], dim=0)
+
+
+def _add_noise_floor(Rrec: torch.Tensor, Rref: torch.Tensor, rel_floor: float = 1e-3) -> torch.Tensor:
+    """Small diagonal floor to keep reconstructed covariance positive definite."""
+    B, N, _ = Rref.shape
+    dtype = Rref.dtype
+    I = cplx_eye(N, Rref.device, dtype=dtype)[None].expand(B, -1, -1)
+    evals = torch.linalg.eigvalsh(hermitize(Rref)).real
+    nf = evals[:, :max(1, N // 3)].mean(dim=-1).clamp_min(1e-6)
+    return hermitize(Rrec + rel_floor * nf[:, None, None].to(dtype) * I)
+
+
+@torch.no_grad()
+def meps_ipnc_weight(
+    Rhat: torch.Tensor,
+    a_nom: torch.Tensor,
+    pos_nom: torch.Tensor,
+    theta_s_nom_deg: float,
+    soi_sector_deg: float = 6.0,
+    grid_i_step_deg: float = 1.0,
+    grid_s_step_deg: float = 1.0,
+    rho: float = 1e-3,
+    estimate_sv: bool = True,
+) -> torch.Tensor:
+    """
+    MEPS-IPNC baseline.
+
+    1) Use MEPS spectrum P_meps(theta)=1/(epsilon_p * |a(theta)^H R^-1 u1|^2).
+    2) Reconstruct IPNC outside the SOI sector.
+    3) Optionally reconstruct desired covariance inside the SOI sector and set a_hat = R_s a_nom.
+    4) MVDR with reconstructed IPNC and a_hat.
+    """
+    B, N, _ = Rhat.shape
+    device = Rhat.device
+    dtype = Rhat.dtype
+    I = cplx_eye(N, device, dtype=dtype)[None].expand(B, -1, -1)
+    Rl = hermitize(Rhat + rho * I)
+
+    u1 = torch.zeros(N, device=device, dtype=dtype)
+    u1[0] = 1.0 + 0.0j
+    Rinv_u1 = torch.linalg.solve(Rl, u1[None, :, None].expand(B, -1, -1)).squeeze(-1)  # [B,N]
+    eps_p = 1.0 / ((torch.conj(u1)[None, :] * Rinv_u1).sum(dim=-1).real.clamp_min(1e-10))  # [B]
+
+    def meps_power(A: torch.Tensor) -> torch.Tensor:
+        # A: [G,N]; return [B,G]
+        z = (torch.conj(A)[None, :, :] * Rinv_u1[:, None, :]).sum(dim=-1)  # a^H R^-1 u1
+        P = 1.0 / (eps_p[:, None] * abs2(z).clamp_min(1e-12))
+        return P / P.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    def reconstruct(A: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
+        G = A.shape[0]
+        Rrec = torch.zeros_like(Rhat)
+        for g in range(G):
+            ag = A[g][None, :].expand(B, -1)
+            Rrec = Rrec + P[:, g][:, None, None].to(dtype) * ag[:, :, None] * ag.conj()[:, None, :]
+        return Rrec / max(1, G)
+
+    # Interference-plus-noise sector: outside SOI sector.
+    theta_i = _sidelobe_uniform_grid(theta_s_nom_deg, soi_sector_deg, grid_i_step_deg, device)
+    A_i = steering_from_positions(pos_nom, theta_i, device, dtype=dtype)
+    R_ipn = reconstruct(A_i, meps_power(A_i))
+    R_ipn = _add_noise_floor(R_ipn, Rhat, rel_floor=1e-2)
+
+    if estimate_sv:
+        theta_s = torch.arange(
+            float(theta_s_nom_deg) - soi_sector_deg,
+            float(theta_s_nom_deg) + soi_sector_deg + 1e-6,
+            grid_s_step_deg,
+            device=device,
+        )
+        A_s = steering_from_positions(pos_nom, theta_s, device, dtype=dtype)
+        R_s = reconstruct(A_s, meps_power(A_s))
+        a_hat = (R_s @ a_nom.unsqueeze(-1)).squeeze(-1)
+        a_hat = normalize_complex_vec(a_hat)
+        # Fallback: avoid rare numerical zero vector.
+        bad = torch.linalg.norm(a_hat, dim=-1) < 1e-8
+        if bad.any():
+            a_hat[bad] = a_nom[bad]
+    else:
+        a_hat = a_nom
+
+    return mvdr_weight(R_ipn, a_hat)
+
+
+def _pglq_theta_nodes_weights(
+    theta_s_nom_deg: float,
+    exclude_deg: float,
+    Q: int,
+    null_width_u: float,
+    device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build PGLQ nodes. Subintervals are uniform in u=sin(theta), then mapped back to theta.
+    null_width_u is the intended broadened null/spectrum width in u-domain.
+    """
+    z_np, w_np = np.polynomial.legendre.leggauss(int(Q))
+    z = torch.tensor(z_np, device=device, dtype=torch.float32)
+    w = torch.tensor(w_np, device=device, dtype=torch.float32)
+
+    dz = float(np.max(np.diff(z_np))) if Q > 1 else 2.0
+    interval_width = max(1e-4, 2.0 * float(null_width_u) / max(dz, 1e-6))
+
+    u_left_end = math.sin((float(theta_s_nom_deg) - exclude_deg) * math.pi / 180.0)
+    u_right_start = math.sin((float(theta_s_nom_deg) + exclude_deg) * math.pi / 180.0)
+
+    intervals = [(-1.0, max(-1.0, min(1.0, u_left_end))),
+                 (max(-1.0, min(1.0, u_right_start)), 1.0)]
+
+    all_theta = []
+    all_weight = []
+    for ua, ub in intervals:
+        if ub <= ua:
+            continue
+        m = max(1, int(math.ceil((ub - ua) / interval_width)))
+        edges = torch.linspace(ua, ub, m + 1, device=device)
+        for k in range(m):
+            a = edges[k]
+            b = edges[k + 1]
+            u_nodes = 0.5 * (a + b) + 0.5 * (b - a) * z
+            u_nodes = u_nodes.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+            theta_nodes = torch.asin(u_nodes) * 180.0 / math.pi
+            weights = 0.5 * (b - a) * w
+            all_theta.append(theta_nodes)
+            all_weight.append(weights)
+
+    return torch.cat(all_theta), torch.cat(all_weight)
+
+
+def _capon_reconstruct_weighted(
+    Rspec: torch.Tensor,
+    Rref: torch.Tensor,
+    A: torch.Tensor,
+    weights: torch.Tensor,
+    rho: float = 1e-3,
+) -> torch.Tensor:
+    """Weighted reconstruction: sum weight(theta) * P_capon(theta) * a a^H."""
+    B, N, _ = Rspec.shape
+    device = Rspec.device
+    dtype = Rspec.dtype
+    I = cplx_eye(N, device, dtype=dtype)[None].expand(B, -1, -1)
+
+    Rl = hermitize(Rspec + rho * I)
+    rhs = A.t().unsqueeze(0).expand(B, -1, -1)  # [B,N,G]
+    RinvA = torch.linalg.solve(Rl, rhs)
+    denom = (A.conj().t().unsqueeze(0) * RinvA).sum(dim=1).real.clamp_min(1e-8)  # [B,G]
+    P = 1.0 / denom
+    P = P / P.mean(dim=-1, keepdim=True).clamp_min(1e-12)
+
+    Rrec = torch.zeros_like(Rref)
+    G = A.shape[0]
+    for g in range(G):
+        ag = A[g][None, :].expand(B, -1)
+        wg = weights[g].to(device=device, dtype=torch.float32)
+        Rrec = Rrec + (wg * P[:, g])[:, None, None].to(dtype) * ag[:, :, None] * ag.conj()[:, None, :]
+    return _add_noise_floor(Rrec, Rref, rel_floor=1e-2)
+
+
+@torch.no_grad()
+def pglq_incm_weight(
+    Rhat: torch.Tensor,
+    a_nom: torch.Tensor,
+    pos_nom: torch.Tensor,
+    theta_s_nom_deg: float,
+    exclude_deg: float = 6.0,
+    Q: int = 3,
+    null_width_u: Optional[float] = None,
+    signal_subspace_dim: Optional[int] = None,
+    eig_energy_thr: float = 0.90,
+    peak_gain: float = 3.0,
+    rho: float = 1e-3,
+) -> torch.Tensor:
+    """
+    PGLQ-INCM baseline with peak-retained Capon spectrum broadening.
+
+    - Build signal subspace from principal eigenvectors.
+    - Amplify dominant subspace: R_d=(I+gP_s)Rhat(I+gP_s)^H.
+    - Apply covariance taper matrix T(m,n)=sin((m-n)Δu)/((m-n)Δu).
+    - Reconstruct INCM using piecewise Gauss-Legendre quadrature outside SOI sector.
+    """
+    B, N, _ = Rhat.shape
+    device = Rhat.device
+    dtype = Rhat.dtype
+    I = cplx_eye(N, device, dtype=dtype)[None].expand(B, -1, -1)
+
+    if null_width_u is None:
+        # A practical default close to a 3-dB beamwidth scale in u=sin(theta).
+        null_width_u = min(0.35, 1.772 / max(2, N))
+
+    evals, evecs = torch.linalg.eigh(hermitize(Rhat))  # ascending
+    idx = torch.argsort(evals, dim=-1, descending=True)
+    evecs_desc = torch.gather(evecs, 2, idx[:, None, :].expand(B, N, N))
+    evals_desc = torch.gather(evals, 1, idx)
+
+    if signal_subspace_dim is None:
+        cs = torch.cumsum(evals_desc.real.clamp_min(0.0), dim=-1)
+        total = cs[:, -1:].clamp_min(1e-12)
+        L_each = (cs / total >= eig_energy_thr).float().argmax(dim=-1) + 1
+        L = int(L_each.float().median().item())
+        L = min(max(1, L), N - 1)
+    else:
+        L = min(max(1, int(signal_subspace_dim)), N - 1)
+
+    Us = evecs_desc[:, :, :L]
+    Ps = Us @ Us.conj().transpose(-1, -2)
+    Rd = (I + float(peak_gain) * Ps) @ Rhat @ (I + float(peak_gain) * Ps).conj().transpose(-1, -2)
+    Rd = hermitize(Rd)
+
+    # Covariance taper matrix T; sinc(x)=sin(x)/x.
+    idx_n = torch.arange(N, device=device, dtype=torch.float32)
+    diff = idx_n[:, None] - idx_n[None, :]
+    x = diff * float(null_width_u)
+    T_real = torch.where(torch.abs(x) < 1e-8, torch.ones_like(x), torch.sin(x) / x)
+    RT = hermitize(Rd * T_real.to(dtype)[None, :, :])
+
+    theta_nodes, q_weights = _pglq_theta_nodes_weights(
+        theta_s_nom_deg=theta_s_nom_deg,
+        exclude_deg=exclude_deg,
+        Q=Q,
+        null_width_u=float(null_width_u),
+        device=device,
+    )
+    A = steering_from_positions(pos_nom, theta_nodes, device, dtype=dtype)
+    R_incm = _capon_reconstruct_weighted(RT, Rhat, A, q_weights, rho=rho)
+
+    return mvdr_weight(R_incm, a_nom)
+
+
+class BlackBoxEigenMLP(nn.Module):
+    """
+    Data-driven black-box baseline:
+    eigen-spectrum tokens -> complex beamforming vector.
+    The output is distortionless-normalized with respect to a_nom.
+    """
+    def __init__(self, N: int, hidden: int = 160, dropout: float = 0.05):
+        super().__init__()
+        self.N = N
+        self.net = nn.Sequential(
+            nn.Linear(3 * N, hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 2 * N),
+        )
+
+    def forward(self, Rhat: torch.Tensor, a_nom: torch.Tensor) -> torch.Tensor:
+        B, N, _ = Rhat.shape
+        tok = eig_tokens(Rhat).reshape(B, -1)
+        y = self.net(tok)
+        w = torch.complex(y[:, :N], y[:, N:])
+        denom = (torch.conj(w) * a_nom).sum(dim=-1)
+        w = w / (torch.conj(denom)[:, None] + 1e-8)
+        return w
+
+class GRURNNBeamformer(nn.Module):
+    """
+    Paper-inspired GRU-RNN beamformer baseline.
+
+    Original paper:
+      AoA sequence -> GRU -> linear layer -> complex array weights.
+    Here:
+      [theta_SOI, theta_J1, theta_J2, theta_J3] -> GRU -> 2N outputs -> complex w.
+    The output is distortionless-normalized w.r.t. a_nom so it can be evaluated
+    with the same SINR metric as other methods.
+    """
+    def __init__(
+        self,
+        N: int,
+        theta_s_nom_deg: float,
+        theta_js_deg: Tuple[float, float, float],
+        hidden_size: int = 512,
+        num_layers: int = 4,
+        dropout: float = 0.05,
+        angle_norm: float = 90.0,
+    ):
+        super().__init__()
+        self.N = N
+        self.theta_s_nom_deg = float(theta_s_nom_deg)
+        self.theta_js_deg = tuple(float(x) for x in theta_js_deg)
+        self.angle_norm = float(angle_norm)
+
+        self.gru = nn.GRU(
+            input_size=1,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
+
+        self.fc = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, 2 * N),
+        )
+
+    def _make_aoa_seq(self, B: int, device) -> torch.Tensor:
+        # [SoI, SoA1, SoA2, SoA3], normalized roughly to [-1, 1]
+        angles = torch.tensor(
+            [self.theta_s_nom_deg, *self.theta_js_deg],
+            device=device,
+            dtype=torch.float32,
+        )
+        seq = angles[None, :, None].expand(B, -1, -1) / self.angle_norm
+        return seq
+
+    def forward(self, Rhat: torch.Tensor, a_nom: torch.Tensor) -> torch.Tensor:
+        B, N, _ = Rhat.shape
+        seq = self._make_aoa_seq(B, Rhat.device)
+
+        h, _ = self.gru(seq)
+        z = h[:, -1, :]          # many-to-one: only final GRU output
+        y = self.fc(z)           # [B, 2N]
+
+        w = torch.complex(y[:, :N], y[:, N:])
+
+        # stabilize early training: avoid zero vector / zero denominator
+        w = w + 1e-3 * a_nom
+
+        # enforce w^H a_nom = 1
+        denom = (torch.conj(w) * a_nom).sum(dim=-1)
+        w = w / (torch.conj(denom)[:, None] + 1e-8)
+
+        return w
+def train_blackbox_model(
+    model: nn.Module,
+    cfg: SimCfg,
+    device,
+    epochs: int,
+    steps_per_epoch: int,
+    batch_size: int,
+    L_choices: Tuple[int, ...],
+    snr_range: Tuple[float, float],
+    error_choices: Tuple[str, ...] = ("angle", "gain_phase", "position", "random_sv", "combined"),
+    array_choices: Tuple[str, ...] = ("ula", "uca", "ccaa"),   # ← 新增
+    lr: float = 3e-4,
+):
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    for ep in range(1, epochs + 1):
+        losses = []
+        for _ in range(steps_per_epoch):
+            array_type = random.choice(array_choices)  # ← 新增
+            L = random.choice(L_choices)
+            snr = snr_range[0] + (snr_range[1] - snr_range[0]) * random.random()
+            err = random.choice(error_choices)
+
+            batch = gen_scene_batch_revision(cfg, batch_size, L, snr, device, array_type=array_type, error_type=err)
+            w = model(batch["Rhat"], batch["a_nom"])
+            sinr = sinr_out_db(w, batch["a_true"], batch["Rin_true"], batch["sigma_s2"])
+            loss = -sinr.mean()
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            losses.append(loss.item())
+
+        print(f"BlackBox epoch {ep:03d}/{epochs} | train(-mean SINR dB)={np.mean(losses):.3f}")
+
+
+def train_model_revision(
+    model: nn.Module,
+    cfg: SimCfg,
+    device,
+    epochs: int,
+    steps_per_epoch: int,
+    batch_size: int,
+    L_choices: Tuple[int, ...],
+    snr_range: Tuple[float, float],
+    error_choices: Tuple[str, ...] = ("angle", "gain_phase", "position", "random_sv", "combined"),
+    array_choices: Tuple[str, ...] = ("ula", "uca", "ccaa"),   # ← 新增这一行
+    lr: float = 3e-4,
+):
+    model.train()
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    for ep in range(1, epochs + 1):
+        losses = []
+        for _ in range(steps_per_epoch):
+            L = random.choice(L_choices)
+            snr = snr_range[0] + (snr_range[1] - snr_range[0]) * random.random()
+            err = random.choice(error_choices)
+            array_type = random.choice(array_choices)          # ← 新增这一行
+
+            batch = gen_scene_batch_revision(
+                cfg, batch_size, L, snr, device,
+                array_type=array_type,          # ← 修改这里（原来写死 "ula"）
+                error_type=err
+            )
+
+            # ... 后面的代码保持不变
+            out = model(batch["Rhat"])
+            w = robust_beamformer_from_params(batch["Rhat"], batch["bar_a"], out["tau"], out["rho"], out["lam_diag"])
+            sinr = sinr_out_db(w, batch["a_true"], batch["Rin_true"], batch["sigma_s2"])
+
+            reg = 1e-4 * (out["rho"] ** 2).mean() + 1e-4 * (out["tau"] ** 2).mean()
+            reg = reg + 1e-5 * (safe_log(out["lam_diag"]) ** 2).mean()
+            loss = -sinr.mean() + reg
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            losses.append(loss.item())
+
+        print(f"Revision train epoch {ep:03d}/{epochs} | train(-mean SINR dB)={np.mean(losses):.3f}")
+
+
+# ---------------------------------------------------------
+# 4) Evaluation with new baselines and new scenarios
+# ---------------------------------------------------------
+@torch.no_grad()
+def eval_methods_revision(
+    cfg: SimCfg,
+    device,
+    snr_db: float,
+    L: int,
+    mc: int,
+    model_dict: Dict[str, nn.Module],
+    array_type: str = "ula",
+    error_type: str = "angle",
+    outage_thr_db: float = -5.0,
+) -> Dict[str, np.ndarray]:
+    batch = gen_scene_batch_revision(cfg, mc, L, snr_db, device, array_type=array_type, error_type=error_type)
+    # ==================== Fast settings for slow CVXPY baselines ====================
+    CVXPY_MC = 10  # 两个慢方法只用 10 个样本；想稳一点可改成 20
+    IRANI_MAX_ITER = 0  # 0 = 不跑 penalty refinement，最快；想稳一点可改成 3
+    WC_MAX_ITERS = 500  # WC-QMI 的 SCS 迭代数；想稳一点可改成 800
+    WC_EPS = 1e-3  # SCS 精度；越大越快
+
+    slow_mc = min(CVXPY_MC, mc)
+
+    batch_slow = {}
+    for k, v in batch.items():
+        if torch.is_tensor(v) and v.ndim > 0 and v.shape[0] == mc:
+            batch_slow[k] = v[:slow_mc]
+        else:
+            batch_slow[k] = v
+    res = {}
+
+    # Oracle (perfect knowledge)
+    w_oracle = mvdr_weight(batch["Rin_true"], batch["a_true"])
+    res["Oracle"] = sinr_out_db(w_oracle, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    # Baselines (fast)
+    w_smi = mvdr_weight(batch["Rhat"], batch["a_nom"])
+    res["SMI MVDR"] = sinr_out_db(w_smi, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_lsmi = lsmi_weight(batch["Rhat"], batch["a_nom"], beta=0.1)
+    res["LSMI"] = sinr_out_db(w_lsmi, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_oas = oas_shrinkage_mvdr_weight(batch["Rhat"], batch["a_nom"], L=L)
+    res["OAS-Shrinkage"] = sinr_out_db(w_oas, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_rcb = rcb_weight(batch["Rhat"], batch["a_nom"], eps=0.15)
+    res["RCB"] = sinr_out_db(w_rcb, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_cmr = cmr_capon_weight(
+        batch["Rhat"], batch["a_nom"], batch["pos_nom"],
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        exclude_deg=10.0, grid_step_deg=2.0, rho=1e-3
+    )
+    res["CMR-Capon"] = sinr_out_db(w_cmr, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    w_meps = meps_ipnc_weight(
+        batch["Rhat"], batch["a_nom"], batch["pos_nom"],
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        soi_sector_deg=6.0,
+        grid_i_step_deg=2.0,
+        grid_s_step_deg=1.0,
+        rho=1e-3,
+        estimate_sv=True,
+    )
+    res["MEPS-IPNC (SPL2020)"] = sinr_out_db(
+        w_meps, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()
+
+    w_pglq = pglq_incm_weight(
+        batch["Rhat"], batch["a_nom"], batch["pos_nom"],
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        exclude_deg=6.0,
+        Q=3,
+        null_width_u=None,
+        signal_subspace_dim=4,
+        peak_gain=3.0,
+        rho=1e-3,
+    )
+    res["PGLQ-INCM (SP2026)"] = sinr_out_db(
+        w_pglq, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()
+
+    # ==================== 临时禁用最慢的两个 CVXPY 方法 ====================
+    # ==================== Slow CVXPY optimization baselines ====================
+
+    # Irani DRO (TSP2025)
+    try:
+        w_irani = irani_dro_weight(
+            batch_slow["Rhat"],
+            batch_slow["a_nom"],
+            max_iter=IRANI_MAX_ITER,
+        )
+        res["Irani DRO (TSP2025)"] = sinr_out_db(
+            w_irani,
+            batch_slow["a_true"],
+            batch_slow["Rin_true"],
+            batch_slow["sigma_s2"],
+        ).cpu().numpy()
+    except Exception as e:
+        print(f"[Warning] Irani DRO failed, fallback to SMI MVDR. Error: {e}")
+        res["Irani DRO (TSP2025)"] = sinr_out_db(
+            w_irani,
+            batch_slow["a_true"],
+            batch_slow["Rin_true"],
+            batch_slow["sigma_s2"],
+        ).cpu().numpy()
+
+    # WC-QMI-A1-LMI (TSP2023)
+    try:
+        w_wc = wc_qmi_a1_lmi_weight(
+            batch_slow["Rhat"],
+            batch_slow["a_nom"],
+            solver="SCS",
+            verbose=False,
+            max_iters=WC_MAX_ITERS,
+            eps=WC_EPS,
+        )
+        res["WC-QMI-A1-LMI (TSP2023)"] = sinr_out_db(
+            w_wc,
+            batch_slow["a_true"],
+            batch_slow["Rin_true"],
+            batch_slow["sigma_s2"],
+        ).cpu().numpy()
+    except Exception as e:
+        print(f"[Warning] WC-QMI-A1-LMI failed, fallback to SMI MVDR. Error: {e}")
+        res["WC-QMI-A1-LMI (TSP2023)"] = sinr_out_db(
+            w_wc,
+            batch_slow["a_true"],
+            batch_slow["Rin_true"],
+            batch_slow["sigma_s2"],
+        ).cpu().numpy()
+
+    # 其他快速方法
+    w_udl = ipn_udl_weight(
+        batch["Rhat"], batch["a_nom"],
+        pos_nom=batch["pos_nom"],
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        d_over_lambda=cfg.d_over_lambda,
+        soi_exclude_deg=10.0,
+        grid_step_deg=2.0,
+        K_udl=3,
+    )
+    res["IPN-UDL (TSP2025)"] = sinr_out_db(
+        w_udl, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()
+
+    pos_nom0 = batch["pos_nom"]
+    w_meps = meps_ipnc_weight(
+        batch["Rhat"], batch["a_nom"], pos_nom0,
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        soi_sector_deg=6.0,
+        grid_i_step_deg=2.0,
+        grid_s_step_deg=1.0,
+        rho=1e-3,
+        estimate_sv=True,
+    )
+    res["MEPS-IPNC (SPL2020)"] = sinr_out_db(
+        w_meps, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()
+
+    w_pglq = pglq_incm_weight(
+        batch["Rhat"], batch["a_nom"], pos_nom0,
+        theta_s_nom_deg=cfg.theta_s_nom_deg,
+        exclude_deg=6.0,
+        Q=3,
+        null_width_u=None,
+        signal_subspace_dim=4,
+        peak_gain=3.0,
+        rho=1e-3,
+    )
+    res["PGLQ-INCM (SP2026)"] = sinr_out_db(
+        w_pglq, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()
+
+    w_irdrcb = irdrcb_krylov_weight(
+        batch["Rhat"], batch["a_nom"],
+        rank=min(6, cfg.N),
+        norm_bound=10.0,
+    )
+    res["IRDRCB-Krylov (Sensors2024)"] = sinr_out_db(
+        w_irdrcb, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]
+    ).cpu().numpy()
+
+    # Proposed models + blackbox baselines
+    for name, mdl in model_dict.items():
+        mdl.eval()
+        if isinstance(mdl, (BlackBoxEigenMLP, CVCNNBeamformer, GRURNNBeamformer)):
+            w = mdl(batch["Rhat"], batch["a_nom"])
+        else:
+            out = mdl(batch["Rhat"])
+            w = robust_beamformer_from_params(
+                batch["Rhat"], batch["bar_a"],
+                out["tau"], out["rho"], out["lam_diag"]
+            )
+        res[name] = sinr_out_db(w, batch["a_true"], batch["Rin_true"], batch["sigma_s2"]).cpu().numpy()
+
+    return res
+def summarize_revision_result(res: Dict[str, np.ndarray], outage_thr_db: float = -5.0) -> List[List]:
+    rows = []
+    for name, v in res.items():
+        rows.append([
+            name,
+            float(np.mean(v)),
+            float(np.median(v)),
+            float(np.std(v)),
+            catastrophic_rate(v, thr_db=outage_thr_db),
+        ])
+    return rows
+
+
+# =========================================================
+# Professional plotting style for many beamforming methods
+# =========================================================
+def canonical_method_name(name: str) -> str:
+    """Map variant names to a canonical key for styling."""
+    if name.startswith("DL-MVDR"):
+        return "DL-MVDR"
+    if "Proposed TM-DRO" in name:
+        return "Proposed TM-DRO"
+    if "BlackBox" in name:
+        return "BlackBox-MLP"
+    if "CVCNN" in name:
+        return "CVCNN (SPL2022)"
+    if name == "Optimal SINR":
+        return "Oracle"
+    return name
+
+
+METHOD_ORDER = [
+    "Oracle",
+    "SMI MVDR",
+    "LSMI",
+    "OAS-Shrinkage",
+
+    "RCB",
+    "IRDRCB-Krylov (Sensors2024)",
+    "WC-QMI-A1-LMI (TSP2023)",
+    "Irani DRO (TSP2025)",
+
+    "CMR-Capon",
+    "MEPS-IPNC (SPL2020)",
+    "PGLQ-INCM (SP2026)",
+    "IPN-UDL (TSP2025)",
+
+    "BlackBox-MLP",
+    "CVCNN (SPL2022)",
+    "Proposed TM-DRO",
+]
+
+METHOD_RANK = {m: i for i, m in enumerate(METHOD_ORDER)}
+
+
+METHOD_STYLE = {
+    "Oracle": {
+        "color": "#111111", "marker": "o", "linestyle": "-", "linewidth": 2.8
+    },
+    "Proposed TM-DRO": {
+        "color": "#D81B60", "marker": "*", "linestyle": "-", "linewidth": 3.1
+    },
+
+    # Recent / robust methods
+    "IPN-UDL (TSP2025)": {
+        "color": "#1E88E5", "marker": "h", "linestyle": "-", "linewidth": 2.4
+    },
+    "WC-QMI-A1-LMI (TSP2023)": {
+        "color": "#00ACC1", "marker": ">", "linestyle": "-", "linewidth": 2.4
+    },
+    "Irani DRO (TSP2025)": {
+        "color": "#7CB342", "marker": "<", "linestyle": "-", "linewidth": 2.4
+    },
+    "IRDRCB-Krylov (Sensors2024)": {
+        "color": "#FB8C00", "marker": "s", "linestyle": "--", "linewidth": 2.3
+    },
+
+    # INCM / IPNC reconstruction
+    "PGLQ-INCM (SP2026)": {
+        "color": "#6D4C41", "marker": "X", "linestyle": "-", "linewidth": 2.3
+    },
+    "MEPS-IPNC (SPL2020)": {
+        "color": "#8E24AA", "marker": "P", "linestyle": "-", "linewidth": 2.3
+    },
+    "CMR-Capon": {
+        "color": "#3949AB", "marker": "d", "linestyle": "-.", "linewidth": 2.2
+    },
+
+    # Classical methods
+    "RCB": {
+        "color": "#9C27B0", "marker": "v", "linestyle": "--", "linewidth": 2.2
+    },
+    "LSMI": {
+        "color": "#2E7D32", "marker": "^", "linestyle": "--", "linewidth": 2.2
+    },
+    "OAS-Shrinkage": {
+        "color": "#F4511E", "marker": "D", "linestyle": "--", "linewidth": 2.2
+    },
+    "SMI MVDR": {
+        "color": "#616161", "marker": "s", "linestyle": ":", "linewidth": 2.1
+    },
+    "DL-MVDR": {
+        "color": "#8D8D8D", "marker": "p", "linestyle": "--", "linewidth": 2.1
+    },
+
+    # Deep learning baselines
+    "BlackBox-MLP": {
+        "color": "#795548", "marker": "D", "linestyle": "-.", "linewidth": 2.2
+    },
+    "CVCNN (SPL2022)": {
+        "color": "#00897B", "marker": "v", "linestyle": "-.", "linewidth": 2.2
+    },
+
+}
+
+METHOD_STYLE["Abl: No token mixing (MLP)"] = {
+    "color": "#F2C94C",
+    "marker": "D",
+    "linestyle": "--",
+    "linewidth": 2.5,
+}
+
+METHOD_STYLE["Abl: Reduced (tau,rho only)"] = {
+    "color": "#FF9F1C",
+    "marker": "^",
+    "linestyle": "-",
+    "linewidth": 2.5,
+}
+
+# =========================================================
+# Beampattern-specific line styles
+# =========================================================
+BEAMPATTERN_LINESTYLE = {
+    "Oracle": "-",
+    "SMI MVDR": ":",
+    "LSMI": "-.",
+    "OAS-Shrinkage": "--",
+
+    "RCB": "-.",
+    "IRDRCB-Krylov (Sensors2024)": "--",
+    "WC-QMI-A1-LMI (TSP2023)": "-.",
+    "Irani DRO (TSP2025)": "-",
+
+    "CMR-Capon": "-",
+    "MEPS-IPNC (SPL2020)": "-",
+    "PGLQ-INCM (SP2026)": "-.",
+    "IPN-UDL (TSP2025)": "-",
+
+    "BlackBox-MLP": "-.",
+    "CVCNN (SPL2022)": "-",
+    "Proposed TM-DRO": "-",
+}
+
+
+def get_beampattern_linestyle(name: str):
+    key = canonical_method_name(name)
+    return BEAMPATTERN_LINESTYLE.get(key, get_method_style(name)["linestyle"])
+
+
+# Distinct colors for bar charts and legends
+METHOD_STYLE.update({
+    "SMI MVDR": {
+        "color": "#4C78A8", "marker": "s", "linestyle": ":", "linewidth": 2.4
+    },
+    "LSMI": {
+        "color": "#F58518", "marker": "^", "linestyle": "--", "linewidth": 2.4
+    },
+    "OAS-Shrinkage": {
+        "color": "#54A24B", "marker": "D", "linestyle": "--", "linewidth": 2.4
+    },
+    "RCB": {
+        "color": "#E45756", "marker": "v", "linestyle": "--", "linewidth": 2.4
+    },
+
+    "IRDRCB-Krylov (Sensors2024)": {
+        "color": "#6A3D9A", "marker": "P", "linestyle": "--", "linewidth": 2.4
+    },
+    "WC-QMI-A1-LMI (TSP2023)": {
+        "color": "#8C564B", "marker": "X", "linestyle": "-.", "linewidth": 2.4
+    },
+    "Irani DRO (TSP2025)": {
+        "color": "#CC79A7", "marker": "<", "linestyle": "-", "linewidth": 2.4
+    },
+
+    "CMR-Capon": {
+        "color": "#7F7F7F", "marker": "d", "linestyle": "-", "linewidth": 2.4
+    },
+    "MEPS-IPNC (SPL2020)": {
+        "color": "#B79F00", "marker": "p", "linestyle": "-", "linewidth": 2.4
+    },
+    "PGLQ-INCM (SP2026)": {
+        "color": "#17BECF", "marker": "x", "linestyle": "-.", "linewidth": 2.4
+    },
+    "IPN-UDL (TSP2025)": {
+        "color": "#A6CEE3", "marker": "h", "linestyle": "-", "linewidth": 2.4
+    },
+
+    "BlackBox-MLP": {
+        "color": "#FFBE7D", "marker": "D", "linestyle": "-.", "linewidth": 2.4
+    },
+    "CVCNN (SPL2022)": {
+        "color": "#003F5C", "marker": "o", "linestyle": "-", "linewidth": 2.4
+    },
+    "Proposed TM-DRO": {
+        "color": "#D81B60", "marker": "*", "linestyle": "-", "linewidth": 3.0
+    },
+})
+def get_method_style(name: str):
+    key = canonical_method_name(name)
+    style = METHOD_STYLE.get(key, None)
+
+    if style is not None:
+        return style
+
+    # Fallback for unexpected method names
+    fallback_colors = [
+        "#4E79A7", "#F28E2B", "#E15759", "#76B7B2",
+        "#59A14F", "#EDC948", "#B07AA1", "#FF9DA7",
+        "#9C755F", "#BAB0AC",
+    ]
+    idx = abs(hash(key)) % len(fallback_colors)
+    return {
+        "color": fallback_colors[idx],
+        "marker": "o",
+        "linestyle": "-",
+        "linewidth": 2.1,
+    }
+
+
+def sort_curve_items(curves: Dict[str, List[float]]):
+    return sorted(
+        curves.items(),
+        key=lambda kv: (
+            METHOD_RANK.get(canonical_method_name(kv[0]), 999),
+            canonical_method_name(kv[0])
+        )
+    )
+
+
+def plot_professional_lines(
+    curves: Dict[str, List[float]],
+    x_list: List[float],
+    xlabel: str,
+    ylabel: str,
+    out_base: str,
+    title: str = None,
+    ylim=None,
+):
+    set_pub_style()
+
+    # Slightly wider figure because the legend has many methods
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+    for name, y in sort_curve_items(curves):
+        y = np.asarray(y, dtype=np.float64)
+        if len(y) != len(x_list):
+            continue
+
+        st = get_method_style(name)
+
+        ax.plot(
+            x_list,
+            y,
+            label=name,
+            color=st["color"],
+            linestyle=st["linestyle"],
+            marker=st["marker"],
+            linewidth=st["linewidth"],
+            markersize=5.8 if canonical_method_name(name) != "Proposed TM-DRO" else 7.8,
+            markerfacecolor=st["color"],
+            markeredgecolor="white",
+            markeredgewidth=0.55,
+            markevery=1,
+        )
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    if title is not None:
+        ax.set_title(title)
+
+    if ylim is not None:
+        ax.set_ylim(ylim)
+
+    apply_axis_style(ax)
+
+    # Professional compact legend
+    handles, labels = ax.get_legend_handles_labels()
+    leg = ax.legend(
+        handles,
+        labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.23),
+        ncol=4,
+        frameon=True,
+        fancybox=False,
+        fontsize=7.4,
+        handlelength=2.1,
+        columnspacing=1.1,
+        handletextpad=0.45,
+        borderaxespad=0.0,
+    )
+    leg.get_frame().set_linewidth(0.7)
+    leg.get_frame().set_alpha(0.96)
+
+    fig.subplots_adjust(bottom=0.34)
+    savefig_dual(out_base)
+    plt.close(fig)
+
+
+def plot_revision_lines(
+    curves: Dict[str, List[float]],
+    x_list: List[float],
+    xlabel: str,
+    ylabel: str,
+    out_base: str,
+):
+    plot_professional_lines(
+        curves,
+        x_list,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        out_base=out_base,
+    )
+
+
+def plot_sinr_vs_snr_curves(
+    curves: Dict[str, List[float]],
+    snr_list: List[float],
+    title: str,
+    out_base: str,
+):
+    plot_professional_lines(
+        curves,
+        snr_list,
+        xlabel="SNR (dB)",
+        ylabel="Output SINR (dB)",
+        out_base=out_base,
+        title=None,
+    )
+
+
+def plot_revision_grouped_bars(table: Dict[str, Dict[str, float]], ylabel: str, out_base: str):
+    set_pub_style()
+
+    groups = list(table.keys())
+    methods = list(next(iter(table.values())).keys())
+    x = np.arange(len(groups), dtype=np.float64)
+    width = 0.82 / max(1, len(methods))
+
+    plt.figure(figsize=(7.2, 4.6))
+    ax = plt.gca()
+
+    # Use global METHOD_STYLE to keep bar colors consistent with line plots
+    methods = sorted(
+        methods,
+        key=lambda m: METHOD_RANK.get(canonical_method_name(m), 999)
+    )
+
+    for j, m in enumerate(methods):
+        y = [table[g][m] for g in groups]
+        st = get_method_style(m)
+        color = st["color"]
+
+        ax.bar(
+            x - 0.41 + width / 2.0 + j * width,
+            y,
+            width,
+            label=m,
+            color=color,
+            edgecolor="black",
+            linewidth=0.8,
+        )
+    plt.xticks(x, groups, rotation=0, ha="center")
+    plt.ylabel(ylabel)
+    apply_axis_style(ax)
+    legend_outside_bottom(ax, max_cols=4, y_offset=-0.38)
+
+    savefig_dual(out_base)
+    plt.close()
+
+# ---------------------------------------------------------
+# 5) Reviewer-specific experiment functions
+# ---------------------------------------------------------
+@torch.no_grad()
+def make_tau_lambda_diagnostic(cfg: SimCfg, device, out_dir: str, L: int = 100, mc: int = 256):
+    """
+    Old scalar-only mapping should give almost zero SINR difference when tau/Lambda change.
+    Revised mapping should give nonzero difference because tau/Lambda modify a_rob.
+    """
+    batch = gen_scene_batch_revision(cfg, mc, L, 10.0, device, array_type="ula", error_type="angle")
+
+    B, N, _ = batch["Rhat"].shape
+    rho = torch.full((B,), 0.1, device=device)
+    tau_1 = torch.zeros(B, device=device)
+    tau_2 = torch.full((B,), 10.0, device=device)
+    lam_1 = torch.ones(B, N, device=device)
+    lam_2 = torch.linspace(0.05, 5.0, N, device=device)[None, :].expand(B, -1)
+
+    w_old_1 = robust_beamformer_scaling_only_old(batch["Rhat"], batch["bar_a"], tau_1, rho, lam_1)
+    w_old_2 = robust_beamformer_scaling_only_old(batch["Rhat"], batch["bar_a"], tau_2, rho, lam_2)
+    s_old_1 = sinr_out_db(w_old_1, batch["a_true"], batch["Rin_true"], batch["sigma_s2"])
+    s_old_2 = sinr_out_db(w_old_2, batch["a_true"], batch["Rin_true"], batch["sigma_s2"])
+
+    w_new_1 = robust_beamformer_from_params(batch["Rhat"], batch["bar_a"], tau_1, rho, lam_1)
+    w_new_2 = robust_beamformer_from_params(batch["Rhat"], batch["bar_a"], tau_2, rho, lam_2)
+    s_new_1 = sinr_out_db(w_new_1, batch["a_true"], batch["Rin_true"], batch["sigma_s2"])
+    s_new_2 = sinr_out_db(w_new_2, batch["a_true"], batch["Rin_true"], batch["sigma_s2"])
+
+    rows = [
+        ["Old scalar-only mapping", "max |ΔSINR|", float((s_old_1 - s_old_2).abs().max().cpu())],
+        ["Old scalar-only mapping", "mean |ΔSINR|", float((s_old_1 - s_old_2).abs().mean().cpu())],
+        ["Revised steering-perturb mapping", "max |ΔSINR|", float((s_new_1 - s_new_2).abs().max().cpu())],
+        ["Revised steering-perturb mapping", "mean |ΔSINR|", float((s_new_1 - s_new_2).abs().mean().cpu())],
+    ]
+
+    write_csv(
+        os.path.join(out_dir, "table_tau_lambda_diagnostic.csv"),
+        ["mapping", "metric", "value"],
+        rows,
+    )
+
+    body = [[r[0], r[1], f"{r[2]:.6g}"] for r in rows]
+    write_tex_table(
+        os.path.join(out_dir, "table_tau_lambda_diagnostic.tex"),
+        caption="Diagnostic of tau and Lambda effects on output SINR.",
+        label="tab:tau_lambda_diagnostic",
+        colspec="llc",
+        header_lines=["Mapping & Metric & Value \\\\"],
+        body_lines=[f"{r[0]} & {r[1]} & {r[2]} \\\\" for r in body],
+        notes="Old scalar-only mapping changes only the beamformer scale, whereas the revised mapping changes the robust steering vector.",
+    )
+
+
+@torch.no_grad()
+def make_sota_snr_curves_revision(
+    cfg: SimCfg,
+    device,
+    out_dir: str,
+    models: Dict[str, nn.Module],
+    snr_list: List[float],
+    L: int = 100,
+    mc_runs: int = 400,
+):
+    curves_mean = {}
+    rows = []
+
+    for snr in snr_list:
+        res = eval_methods_revision(
+            cfg, device, snr_db=snr, L=L, mc=mc_runs,
+            model_dict=models, array_type="ula", error_type="angle",
+        )
+        for name, values in res.items():
+            curves_mean.setdefault(name, []).append(float(np.mean(values)))
+            rows.append([
+                snr,
+                name,
+                float(np.mean(values)),
+                float(np.median(values)),
+                catastrophic_rate(values, thr_db=-5.0),
+            ])
+
+    write_csv(
+        os.path.join(out_dir, f"data_sota_snr_curves_L{L}.csv"),
+        ["snr_db", "method", "mean_sinr_db", "median_sinr_db", "outage_percent"],
+        rows,
+    )
+
+    plot_revision_lines(
+        curves_mean,
+        snr_list,
+        xlabel="SNR (dB)",
+        ylabel="Output SINR (dB)",
+        out_base=os.path.join(out_dir, f"fig_sota_snr_curves_L{L}"),
+    )
+
+
+@torch.no_grad()
+def make_nonangle_error_scenarios_revision(
+    cfg: SimCfg,
+    device,
+    out_dir: str,
+    models: Dict[str, nn.Module],
+    L: int = 100,
+    snr_db: float = 10.0,
+    mc_runs: int = 400,
+):
+    scenario_map = {
+        "Angle error": "angle",
+        "Gain/phase error": "gain_phase",
+        "Position error": "position",
+        "Random SV error": "random_sv",
+        "Combined error": "combined",
+    }
+
+    keep_methods = [
+                       "SMI MVDR",
+                       "LSMI",
+                       "OAS-Shrinkage",
+
+                       "RCB",
+                       "IRDRCB-Krylov (Sensors2024)",
+                       "WC-QMI-A1-LMI (TSP2023)",
+                       "Irani DRO (TSP2025)",
+
+                       "CMR-Capon",
+                       "MEPS-IPNC (SPL2020)",
+                       "PGLQ-INCM (SP2026)",
+                       "IPN-UDL (TSP2025)",
+
+                       "BlackBox-MLP",
+                       "CVCNN (SPL2022)",
+                       "Proposed TM-DRO",
+                   ]+ list(models.keys())
+    table_mean = {}
+    table_outage = {}
+    rows = []
+
+    for label, err in scenario_map.items():
+        res = eval_methods_revision(
+            cfg, device, snr_db=snr_db, L=L, mc=mc_runs,
+            model_dict=models, array_type="ula", error_type=err,
+        )
+
+        table_mean[label] = {}
+        table_outage[label] = {}
+
+        for m in keep_methods:
+            if m not in res:
+                continue
+            table_mean[label][m] = float(np.mean(res[m]))
+            table_outage[label][m] = catastrophic_rate(res[m], thr_db=-5.0)
+            rows.append([
+                err,
+                m,
+                float(np.mean(res[m])),
+                float(np.median(res[m])),
+                catastrophic_rate(res[m], thr_db=-5.0),
+            ])
+
+    write_csv(
+        os.path.join(out_dir, "table_nonangle_error_scenarios.csv"),
+        ["scenario", "method", "mean_sinr_db", "median_sinr_db", "outage_percent"],
+        rows,
+    )
+
+    plot_revision_grouped_bars(
+        table_mean,
+        ylabel="Output SINR (dB)",
+        out_base=os.path.join(out_dir, "fig_nonangle_error_scenarios_mean_sinr"),
+    )
+
+    plot_revision_grouped_bars(
+        table_outage,
+        ylabel="Outage rate (%)",
+        out_base=os.path.join(out_dir, "fig_nonangle_error_scenarios_outage"),
+    )
+
+
+@torch.no_grad()
+def make_array_geometry_revision(
+    cfg: SimCfg,
+    device,
+    out_dir: str,
+    models: Dict[str, nn.Module],
+    L: int = 100,
+    snr_db: float = 10.0,
+    mc_runs: int = 400,
+):
+    array_map = {
+        "ULA": "ula",
+        "UCA": "uca",
+        "CCAA": "ccaa",
+    }
+
+    keep_methods = [
+                       "SMI MVDR",
+                       "LSMI",
+                       "OAS-Shrinkage",
+
+                       "RCB",
+                       "IRDRCB-Krylov (Sensors2024)",
+                       "WC-QMI-A1-LMI (TSP2023)",
+                       "Irani DRO (TSP2025)",
+
+                       "CMR-Capon",
+                       "MEPS-IPNC (SPL2020)",
+                       "PGLQ-INCM (SP2026)",
+                       "IPN-UDL (TSP2025)",
+
+                       "BlackBox-MLP",
+                       "CVCNN (SPL2022)",
+                       "Proposed TM-DRO",
+                   ]+ list(models.keys())
+    table_mean = {}
+    rows = []
+
+    for label, arr in array_map.items():
+        res = eval_methods_revision(
+            cfg, device, snr_db=snr_db, L=L, mc=mc_runs,
+            model_dict=models, array_type=arr, error_type="combined",
+        )
+
+        table_mean[label] = {}
+        for m in keep_methods:
+            if m not in res:
+                continue
+            table_mean[label][m] = float(np.mean(res[m]))
+            rows.append([
+                arr,
+                m,
+                float(np.mean(res[m])),
+                float(np.median(res[m])),
+                catastrophic_rate(res[m], thr_db=-5.0),
+            ])
+
+    write_csv(
+        os.path.join(out_dir, "table_array_geometry_generalization.csv"),
+        ["array_type", "method", "mean_sinr_db", "median_sinr_db", "outage_percent"],
+        rows,
+    )
+
+    plot_revision_grouped_bars(
+        table_mean,
+        ylabel="Output SINR (dB)",
+        out_base=os.path.join(out_dir, "fig_array_geometry_generalization"),
+    )
+
+
+def count_trainable_params(model: nn.Module) -> int:
+    return int(sum(p.numel() for p in model.parameters() if p.requires_grad))
+
+
+@torch.no_grad()
+@torch.no_grad()
+def make_complexity_latency_revision(
+    cfg: SimCfg,
+    device,
+    out_dir: str,
+    models: Dict[str, nn.Module],
+    batch_size: int = 256,
+    L: int = 100,
+    repeat: int = 30,
+):
+    """
+    Measure inference latency for different model types (parametric + blackbox).
+    """
+    batch = gen_scene_batch_revision(cfg, batch_size, L, 10.0, device, array_type="ula", error_type="combined")
+    rows = []
+
+    for name, mdl in models.items():
+        mdl.eval()
+
+        # Warm-up
+        for _ in range(5):
+            if isinstance(mdl, (BlackBoxEigenMLP, CVCNNBeamformer, GRURNNBeamformer)):
+                w = mdl(batch["Rhat"], batch["a_nom"])
+            else:
+                out = mdl(batch["Rhat"])
+                w = robust_beamformer_from_params(
+                    batch["Rhat"], batch["bar_a"],
+                    out["tau"], out["rho"], out["lam_diag"]
+                )
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
+        for _ in range(repeat):
+            if isinstance(mdl, (BlackBoxEigenMLP, CVCNNBeamformer, GRURNNBeamformer)):
+                w = mdl(batch["Rhat"], batch["a_nom"])
+            else:
+                out = mdl(batch["Rhat"])
+                w = robust_beamformer_from_params(
+                    batch["Rhat"], batch["bar_a"],
+                    out["tau"], out["rho"], out["lam_diag"]
+                )
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+
+        batch_ms = 1000.0 * (time.perf_counter() - t0) / float(repeat)
+        per_sample_ms = batch_ms / float(batch_size)
+
+        rows.append([
+            name,
+            count_trainable_params(mdl),
+            f"{batch_ms:.4f}",
+            f"{per_sample_ms:.6f}",
+        ])
+
+    write_csv(
+        os.path.join(out_dir, "table_complexity_latency.csv"),
+        ["method", "trainable_params", "batch_ms", "per_sample_ms"],
+        rows,
+    )
+
+    write_tex_table(
+        os.path.join(out_dir, "table_complexity_latency.tex"),
+        caption="Model size and inference latency.",
+        label="tab:complexity_latency",
+        colspec="lccc",
+        header_lines=["Method & Params & Batch latency (ms) & Per-sample latency (ms) \\\\"],
+        body_lines=[f"{r[0]} & {r[1]} & {r[2]} & {r[3]} \\\\" for r in rows],
+        notes="Latency is measured for a batch of covariance matrices including neural inference and differentiable beamforming mapping.",
+    )
+
+@torch.no_grad()
+def make_ablation_table_revision(
+    cfg: SimCfg,
+    device,
+    out_dir: str,
+    ablation_models: Dict[str, nn.Module],
+    L: int = 100,
+    snr_db: float = 10.0,
+    mc_runs: int = 400,
+):
+    res = eval_methods_revision(
+        cfg, device, snr_db=snr_db, L=L, mc=mc_runs,
+        model_dict=ablation_models, array_type="ula", error_type="combined",
+    )
+
+    rows = summarize_revision_result(res, outage_thr_db=-5.0)
+
+    write_csv(
+        os.path.join(out_dir, "table_ablation_revision.csv"),
+        ["method", "mean_sinr_db", "median_sinr_db", "std_sinr_db", "outage_percent"],
+        rows,
+    )
+
+    write_tex_table(
+        os.path.join(out_dir, "table_ablation_revision.tex"),
+        caption="Ablation under combined mismatch.",
+        label="tab:ablation_revision",
+        colspec="lcccc",
+        header_lines=["Method & Mean SINR & Median SINR & Std. & Outage (\\%) \\\\"],
+        body_lines=[f"{r[0]} & {r[1]:.2f} & {r[2]:.2f} & {r[3]:.2f} & {r[4]:.1f} \\\\" for r in rows],
+        notes="Outage means the percentage of trials with output SINR below -5 dB.",
+    )
+# =========================================================
+# Main
+# =========================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--out_dir", type=str, default="./outputs_allfigs_paper")
+
+    # training
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--steps_per_epoch", type=int, default=180)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=3e-4)
+
+    # model
+    parser.add_argument("--d_model", type=int, default=96)
+    parser.add_argument("--n_layers", type=int, default=3)
+
+    # sim
+    parser.add_argument("--N", type=int, default=10)
+    parser.add_argument("--mismatch_std_deg", type=float, default=2.0)
+    parser.add_argument("--INR_dB", type=float, default=20.0)
+    parser.add_argument("--theta_j1", type=float, default=20.0)
+    parser.add_argument("--theta_j2", type=float, default=50.0)
+    parser.add_argument("--theta_j3", type=float, default=65.0)
+
+    # eval
+    parser.add_argument("--mc_runs", type=int, default=300)
+    parser.add_argument("--fast", type=int, default=0, help="1=run faster (less training/eval)")
+
+    args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    set_seed(args.seed)
+    set_pub_style()
+
+    device = torch.device(args.device)
+
+    cfg = SimCfg(
+        N=args.N,
+        mismatch_std_deg=args.mismatch_std_deg,
+        INR_dB=args.INR_dB,
+        theta_js_deg=(args.theta_j1, args.theta_j2, args.theta_j3),
+    )
+
+    # ---- Create models ----
+    model_full = EigenTokenSSM(N=cfg.N, d_model=args.d_model, n_layers=args.n_layers, dropout=0.05).to(device)
+    model_mlp_reduced = EigenMLPParam(N=cfg.N, hidden=128, dropout=0.05).to(device)
+    model_no_mixing = EigenTokenMLP(N=cfg.N, d_model=args.d_model, hidden=192, dropout=0.05).to(device)
+    model_no_lam = EigenTokenSSM_NoLam(N=cfg.N, d_model=args.d_model, n_layers=args.n_layers, dropout=0.05).to(device)
+    model_only_rho = OnlyRhoModel(N=cfg.N, hidden=128, dropout=0.05).to(device)
+
+    # ---- Training schedule ----
+    if args.fast == 1:
+        epochs = max(4, args.epochs // 3)
+        steps_per_epoch = max(60, args.steps_per_epoch // 3)
+        mc_runs = max(120, args.mc_runs // 2)
+        mc_table = max(240, args.mc_runs)
+        n_embed = 40
+    else:
+        epochs = args.epochs
+        steps_per_epoch = args.steps_per_epoch
+        mc_runs = args.mc_runs
+        mc_table = 600
+        n_embed = 60
+
+    L_choices = (16, 32, 48)
+    snr_range = (-15.0, 25.0)
+
+    # ---- Train models ----
+    print("\n=== Training: Proposed (Full) ===")
+    train_model(model_full, cfg, device, epochs, steps_per_epoch, args.batch_size, L_choices, snr_range, lr=args.lr)
+
+    print("\n=== Training: Reduced (learn tau,rho) ===")
+    train_model(model_mlp_reduced, cfg, device, max(3, epochs), max(60, steps_per_epoch ),
+                args.batch_size, L_choices, snr_range, lr=args.lr)
+
+    print("\n=== Training: Ablation (No token mixing) ===")
+    train_model(model_no_mixing, cfg, device, max(3, epochs ), max(60, steps_per_epoch ),
+                args.batch_size, L_choices, snr_range, lr=args.lr)
+
+    print("\n=== Training: Ablation (No lam learning) ===")
+    train_model(model_no_lam, cfg, device, max(3, epochs ), max(60, steps_per_epoch ),
+                args.batch_size, L_choices, snr_range, lr=args.lr)
+
+    print("\n=== Training: Ablation (Only rho) ===")
+    train_model(model_only_rho, cfg, device, max(3, epochs ), max(60, steps_per_epoch ),
+                args.batch_size, L_choices, snr_range, lr=args.lr)
+    print("\n=== Revision retraining: Reduced tau/rho only ===")
+
+    # ---- Models for main plots ----
+    models_main = {
+        "Proposed TM-DRO": model_full,
+        "Proposed TM-DRO (learn tau,rho)": model_mlp_reduced,
+    }
+
+    # ======================================================
+    # Reviewer-driven retraining BEFORE all figures/tables
+    # （训练时随机使用 ULA / UCA / CCAA）
+    # ======================================================
+    retrain_for_revision = True
+
+    if retrain_for_revision:
+        error_choices = ("angle", "gain_phase", "position", "random_sv", "combined")
+
+        print("\n=== Revision retraining: Proposed TM-DRO ===")
+        train_model_revision(
+            model_full, cfg, device,
+            epochs=max(3, epochs),
+            steps_per_epoch=max(60, steps_per_epoch),
+            batch_size=args.batch_size,
+            L_choices=L_choices,
+            snr_range=snr_range,
+            error_choices=error_choices,
+            array_choices=("ula", "uca", "ccaa"),  # ← 随机三种阵列
+            lr=args.lr,
+        )
+
+        print("\n=== Revision retraining: Reduced tau/rho only ===")
+        train_model_revision(
+            model_mlp_reduced, cfg, device,
+            epochs=max(3, epochs),
+            steps_per_epoch=max(60, steps_per_epoch),
+            batch_size=args.batch_size,
+            L_choices=L_choices,
+            snr_range=snr_range,
+            error_choices=error_choices,
+            array_choices=("ula", "uca", "ccaa"),
+            lr=args.lr,
+        )
+
+        print("\n=== Revision retraining: No token mixing ===")
+        train_model_revision(
+            model_no_mixing, cfg, device,
+            epochs=max(3, epochs),
+            steps_per_epoch=max(60, steps_per_epoch),
+            batch_size=args.batch_size,
+            L_choices=L_choices,
+            snr_range=snr_range,
+            error_choices=error_choices,
+            array_choices=("ula", "uca", "ccaa"),
+            lr=args.lr,
+        )
+
+        print("\n=== Revision retraining: No Lambda ===")
+        train_model_revision(
+            model_no_lam, cfg, device,
+            epochs=max(3, epochs),
+            steps_per_epoch=max(60, steps_per_epoch),
+            batch_size=args.batch_size,
+            L_choices=L_choices,
+            snr_range=snr_range,
+            error_choices=error_choices,
+            array_choices=("ula", "uca", "ccaa"),
+            lr=args.lr,
+        )
+
+        print("\n=== Revision retraining: Only rho ===")
+        train_model_revision(
+            model_only_rho, cfg, device,
+            epochs=max(3, epochs),
+            steps_per_epoch=max(60, steps_per_epoch),
+            batch_size=args.batch_size,
+            L_choices=L_choices,
+            snr_range=snr_range,
+            error_choices=error_choices,
+            array_choices=("ula", "uca", "ccaa"),
+            lr=args.lr,
+        )
+
+
+    # Data-driven black-box baseline requested by reviewer.
+    model_blackbox = BlackBoxEigenMLP(cfg.N).to(device)
+    print("\n=== Training: BlackBox Eigen-MLP beamformer baseline ===")
+    train_blackbox_model(
+        model_blackbox, cfg, device,
+        epochs=max(3, epochs),
+        steps_per_epoch=max(60, steps_per_epoch),
+        batch_size=args.batch_size,
+        L_choices=L_choices,
+        snr_range=snr_range,
+        error_choices=("angle", "gain_phase", "position", "random_sv", "combined"),
+        array_choices=("ula", "uca", "ccaa"),  # ← 新增
+        lr=args.lr,
+    )
+
+    models_revision_main = {
+        "Proposed TM-DRO": model_full,
+        "BlackBox-MLP": model_blackbox,
+    }
+
+    models_revision_ablation = {
+        "Proposed TM-DRO": model_full,
+        "No token mixing": model_no_mixing,
+        "No Lambda": model_no_lam,
+        "Reduced tau/rho only": model_mlp_reduced,
+        "Only rho": model_only_rho,
+        "BlackBox-MLP": model_blackbox,
+    }
+
+
+
+    # ====================== CVCNN baseline (SPL 2022) ======================
+    model_cvcnn = CVCNNBeamformer(cfg.N).to(device)
+    print("\n=== Training: CVCNN baseline (Mohammadzadeh et al. SPL 2022) ===")
+    train_blackbox_model(
+        model_cvcnn, cfg, device,
+        epochs=max(4, epochs),
+        steps_per_epoch=max(80, steps_per_epoch),
+        batch_size=args.batch_size,
+        L_choices=L_choices,
+        snr_range=snr_range,
+        error_choices=error_choices,
+        array_choices=("ula", "uca", "ccaa"),
+        lr=args.lr * 0.5,          # 稍微小一点的学习率更稳定
+    )
+
+    # ====================== GRU-RNN baseline ======================
+    # model_gru_rnn = GRURNNBeamformer(
+    #     N=cfg.N,
+    #     theta_s_nom_deg=cfg.theta_s_nom_deg,
+    #     theta_js_deg=cfg.theta_js_deg,
+    #     hidden_size=512,  # 论文推荐量级；调试时可先用 128 或 256
+    #     num_layers=4,
+    #     dropout=0.05,
+    # ).to(device)
+    #
+    # print("\n=== Training: GRU-RNN beamformer baseline ===")
+    # train_blackbox_model(
+    #     model_gru_rnn, cfg, device,
+    #     epochs=max(4, epochs),
+    #     steps_per_epoch=max(80, steps_per_epoch),
+    #     batch_size=args.batch_size,
+    #     L_choices=L_choices,
+    #     snr_range=snr_range,
+    #     error_choices=error_choices,
+    #     array_choices=("ula", "uca", "ccaa"),
+    #     lr=args.lr * 0.5,
+    # )
+    #
+    # models_revision_main["GRU-RNN (NN-ABF)"] = model_gru_rnn
+    # models_revision_ablation["GRU-RNN (NN-ABF)"] = model_gru_rnn
+
+    # 更新 revision 对比字典
+    models_revision_main["CVCNN (SPL2022)"] = model_cvcnn
+    models_revision_ablation["CVCNN (SPL2022)"] = model_cvcnn
+
+    # =========================================================
+    # TEMP: only redraw beampattern
+    # =========================================================
+    make_revision_beampattern_fig(
+        cfg,
+        device,
+        out_dir=args.out_dir,
+        models=models_revision_main,
+        L=100,
+        snr_db=10.0,
+        array_type="ula",
+        error_type="angle",
+    )
+
+    # 如果还需要 L=500，也保留下面这个
+    make_revision_beampattern_fig(
+        cfg,
+        device,
+        out_dir=args.out_dir,
+        models=models_revision_main,
+        L=500,
+        snr_db=10.0,
+        array_type="ula",
+        error_type="angle",
+    )
+
+
+
+    make_tau_lambda_diagnostic(
+        cfg, device, args.out_dir,
+        L=100,
+        mc=max(200, mc_runs // 2),
+    )
+
+    make_sota_snr_curves_revision(
+        cfg, device, args.out_dir,
+        models=models_revision_main,
+        snr_list=list(range(-20, 31, 5)),
+        L=100,
+        mc_runs=mc_runs,
+    )
+
+    make_ablation_table_revision(
+        cfg, device, args.out_dir,
+        ablation_models=models_revision_ablation,
+        L=100,
+        snr_db=10.0,
+        mc_runs=mc_table,
+    )
+
+    make_nonangle_error_scenarios_revision(
+        cfg, device, args.out_dir,
+        models=models_revision_main,
+        L=100,
+        snr_db=10.0,
+        mc_runs=mc_runs,
+    )
+
+    make_array_geometry_revision(
+        cfg, device, args.out_dir,
+        models=models_revision_main,
+        L=100,
+        snr_db=10.0,
+        mc_runs=mc_runs,
+    )
+
+    make_complexity_latency_revision(
+        cfg, device, args.out_dir,
+        models=models_revision_ablation,
+        batch_size=256,
+        L=100,
+        repeat=30,
+    )
+    # ---- SNR lists / snapshot settings ----
+    snr_list = list(range(-20, 31, 5))
+
+    for L_plot in [100, 500]:
+        # Output SINR vs SNR
+        make_sota_snr_curves_revision(
+            cfg,
+            device,
+            args.out_dir,
+            models=models_revision_main,
+            snr_list=snr_list,
+            L=L_plot,
+            mc_runs=mc_runs,
+        )
+
+        # Normalized beampattern
+        make_revision_beampattern_fig(
+            cfg,
+            device,
+            args.out_dir,
+            models=models_revision_main,
+            L=L_plot,
+            snr_db=10.0,
+        )
+    # ======================================================
+    # FIGURES (ALL)
+    # ======================================================
+
+    make_sinr_vs_snr_figs(cfg, device, args.out_dir, models_main, snr_list, L=100, mc_runs=mc_runs,
+                          fig_name="fig2a_sinr_vs_snr", export_prefix="data_sinr_vs_snr_fig2a")
+    make_sinr_vs_snr_figs(cfg, device, args.out_dir, models_main, snr_list, L=500, mc_runs=mc_runs,
+                          fig_name="fig2b_sinr_vs_snr", export_prefix="data_sinr_vs_snr_fig2b")
+
+    # (3) Beampattern (fixed SNR)
+    with torch.no_grad():
+        batch = gen_scene_custom(cfg, B=1, L=500, snr_db=10.0, device=device,
+                                 inr_db=cfg.INR_dB, mismatch_std_deg=cfg.mismatch_std_deg)
+        w_opt = mvdr_weight(batch["Rin_true"], batch["a_nom"])[0]
+        w_smi = mvdr_weight(batch["Rhat"], batch["a_nom"])[0]
+        w_shr = shrinkage_mvdr_weight(batch["Rhat"], batch["a_nom"], alpha=0.1)[0]
+
+        out_full = model_full(batch["Rhat"])
+        w_prop = robust_beamformer_from_params(batch["Rhat"], batch["bar_a"], out_full["tau"], out_full["rho"], out_full["lam_diag"])[0]
+
+        out_red = model_mlp_reduced(batch["Rhat"])
+        w_prop2 = robust_beamformer_from_params(batch["Rhat"], batch["bar_a"], out_red["tau"], out_red["rho"], out_red["lam_diag"])[0]
+
+        weights_dict = {
+            "Optimal SINR": w_opt,
+            "Proposed TM-DRO": w_prop,
+            "Proposed TM-DRO (learn tau,rho)": w_prop2,
+            "SMI MVDR": w_smi,
+            "Shrinkage-MVDR": w_shr,
+        }
+        plot_beampattern_annotated(cfg, device, weights_dict,
+                                   out_base=os.path.join(args.out_dir, "fig2c_beampattern"))
+
+    # (4)(5) Cov heatmaps + eigen-spectra
+    make_cov_and_spectrum_figs(cfg, device, args.out_dir, L=500, snr_db=10.0)
+
+    # (6) Ablation SINR vs SNR (L=100)
+    ablation_models = {
+        "Proposed TM-DRO": model_full,
+        "Abl: No token mixing (MLP)": model_no_mixing,
+        "Abl: No lam (lam=1)": model_no_lam,
+        "Abl: Reduced (tau,rho only)": model_mlp_reduced,
+        "Abl: Only rho": model_only_rho,
+    }
+    make_ablation_fig(cfg, device, args.out_dir, ablation_models, snr_list, L=100, mc_runs=mc_runs)
+
+    # (7) Robustness phase diagrams (SNR × mismatch)
+    mismatch_grid = [0.0, 1.0, 2.0, 3.0, 4.0, 6.0]
+    snr_grid = [-10, -5, 0, 5, 10, 15, 20]
+    make_robustness_phase_diagram(cfg, device, args.out_dir, model_full,
+                                  snr_grid, mismatch_grid, L=100, mc_runs=max(120, mc_runs // 2))
+
+    # (8) Snapshot sensitivity (SINR vs L)
+    L_list = [16, 32, 64, 100, 200, 500]
+    snr_for_L = [0.0, 10.0, 20.0]
+    make_snapshot_sensitivity(cfg, device, args.out_dir,
+                              proposed_model=model_full,
+                              L_list=L_list, snr_list=snr_for_L,
+                              mc_runs=max(120, mc_runs // 2))
+
+    # (9) Token embedding PCA 2D# Models: token mixing blocks + variants
+    make_embedding_pca_fig(cfg, device, args.out_dir, model_full, L=200, snr_db=10.0,
+                           n_per_class=n_embed)
+
+    # Paper tables
+    make_paper_tables(cfg, device, args.out_dir,
+                      models_main=models_main,
+                      L_list=[100, 500],
+                      snr_db=10.0,
+                      mc_runs=mc_table)
+
+    print(f"\nAll figures + tables saved to: {args.out_dir}\n"
+          f"Tip: LaTeX 插图优先用 .pdf（矢量清晰），表直接 \\\\input{{...tex}} 即可。")
+
+
+
+if __name__ == "__main__":
+
+    main()
